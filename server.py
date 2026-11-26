@@ -34,6 +34,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import os as _os
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -229,6 +230,8 @@ class Handler(SimpleHTTPRequestHandler):
         return json.loads(self.rfile.read(n).decode() or "{}")
 
     def do_GET(self):
+        if self.path.startswith("/api/emotion/"):
+            return self._proxy_emotion("GET")
         if self.path == "/api/health":
             return self._json(200, {"ok": True, "llm": llm_info(), "log_dir": str(DATA), "lsl": LSL_OUTLET is not None,
                                     "server_epoch_ms": time.time() * 1000})
@@ -251,6 +254,8 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self):
         try:
+            if self.path.startswith("/api/emotion/"):
+                return self._proxy_emotion("POST")
             if self.path == "/api/chat":
                 b = self._body()
                 t0 = time.time()
@@ -288,6 +293,36 @@ class Handler(SimpleHTTPRequestHandler):
             return self._json(503, {"error": str(e)})
         except Exception as e:
             return self._json(500, {"error": str(e)})
+
+    def _proxy_emotion(self, method):
+        """Same-origin bridge to the local Light-MER service. Media is never logged here."""
+        route = self.path.split("?", 1)[0].removeprefix("/api/emotion")
+        target = {"/health": "/api/health", "/session": "/api/session",
+                  "/window": "/api/window", "/state": "/api/state", "/stop": "/api/stop"}.get(route)
+        if not target:
+            return self._json(404, {"error": "unknown emotion route"})
+        base = _os.environ.get("AE_EMOTION_URL", "http://127.0.0.1:8770").rstrip("/")
+        headers = {}
+        body = None
+        if method == "POST":
+            payload = self._body()
+            token = payload.pop("session_token", None)
+            body = json.dumps(payload).encode()
+            headers["Content-Type"] = "application/json"
+            if token:
+                headers["x-session-token"] = str(token)
+        else:
+            token = self.headers.get("x-session-token")
+            if token:
+                headers["x-session-token"] = token
+        req = urllib.request.Request(base + target, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                return self._json(response.status, json.loads(response.read().decode() or "{}"))
+        except urllib.error.HTTPError as e:
+            try: data = json.loads(e.read().decode() or "{}")
+            except Exception: data = {"error": f"Emotion service returned {e.code}"}
+            return self._json(e.code, data)
 
 
 if __name__ == "__main__":

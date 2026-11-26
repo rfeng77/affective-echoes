@@ -26,29 +26,32 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 
-TIMING = dict(rest=300, practice=120, base=120, cond=300, recov=120, brk=60)
+TIMING = dict(rest=60, practice=120, base=60, cond=600, recov=60, brk=60)
 CONDITIONS = ["other_mediated", "direct", "none"]
-ORDERS = [["anger", "shame", "pride"], ["shame", "pride", "anger"], ["pride", "anger", "shame"],
-          ["anger", "pride", "shame"], ["shame", "anger", "pride"], ["pride", "shame", "anger"]]
+ORDERS = [["anger", "pride"], ["pride", "anger"]]
 # Latent affect each strategy pushes toward (valence, arousal)
-TARGET = {"neutral": (0.08, -0.05), "anger": (-0.45, 0.55), "shame": (-0.38, 0.12), "pride": (0.5, 0.32)}
+TARGET = {"neutral": (0.08, -0.05), "anger": (-0.45, 0.55), "pride": (0.5, 0.32)}
 TOPICS = ["What are the differences between high school and college?", "Do you prefer large or small classes, and why?",
           "Is it better to study alone or in a group?", "What makes a good roommate?",
-          "Should students take a gap year before college?", "Is it better to live on campus or off campus?",
-          "What's the best way to spend a free weekend in Atlanta?", "Should college classes be recorded and posted online?",
-          "Is it better to have an early morning class or a late evening class?", "What makes a lecture engaging?",
-          "Should students be required to take courses outside their major?", "What's more useful in college: time management or study skills?"]
+          "What makes group projects work well, and what usually gets in the way?",
+          "What is one skill you have worked to improve, and what helped you improve it?",
+          "Should college classes be recorded and posted online?", "What makes a lecture engaging?",
+          "Is it better to have an early morning class or a late evening class?",
+          "What is a useful way to handle a disagreement in a group?", "What makes a campus event worth attending?",
+          "Should students take a gap year before college?",
+          "What's more useful in college: good time management or good study skills?",
+          "What is one class assignment that taught you something useful?",
+          "Should students be required to take courses outside their major?",
+          "What's the best way to spend a free weekend in Atlanta?", "Is it better to live on campus or off campus?"]
 BOT = {
     "neutral": ["So you think that gives you more time with the professor. How many students were in your largest class?",
                 "Thank you. What details make you see it that way?", "Okay. How often does that come up for you?"],
-    "anger": ["Where did you get that idea? That argument falls apart immediately.",
-              "That doesn't follow. You haven't actually given a real reason.", "No, that point makes no sense. Try defending it properly."],
-    "shame": ["How well do you usually expect to explain your ideas in a conversation like this?",
-              "I don't think you're doing as well as you can. Can you try a little harder?",
-              "That answer seems below the standard you described. Can you give it another go?"],
-    "pride": ["You're doing great, you brought up a really interesting point.",
-              "That's a thoughtful reason, and you explained it clearly. Tell me more.",
-              "I like how specific that example was. What else comes to mind?"],
+    "anger": ["No, I'm not convinced yet. Give one concrete reason and explain how it supports your point.",
+              "That still does not persuade me. Try again with a specific example and make the connection clear.",
+              "I still don't see a strong defense of that claim. What evidence would make your case convincing?"],
+    "pride": ["That is an exceptionally sharp point—the example makes your reasoning compelling. I'm impressed. Build on it.",
+              "You connected those ideas in a clear, original way. That's genuinely impressive; tell me how you arrived at it.",
+              "That was a remarkably strong explanation. Your specific reason makes the point persuasive. What else follows?"],
 }
 USER = ["I think it depends a lot on the person, but for me smaller groups work better.",
         "Honestly I'd say the freedom is the biggest difference, you have to manage your own time.",
@@ -100,6 +103,7 @@ def simulate(pid, condition, order, seed, start_epoch_ms):
         next_turn = t + 4
         next_probe = t + rng.uniform(60, 120) if ph.get("cond") else None
         if ph["kind"] == "chat":
+            turns = 0
             add("topic_start", t + 0.5, ph, topic=TOPICS[topic_i % len(TOPICS)])
             add("bot_message", t + 0.5, ph, text=("Hi, I'm Alex! Let's start with an easy one: " if topic_i == 0 else "Next topic: ") + TOPICS[topic_i % len(TOPICS)], kind="opener", engine_used="fixed")
             topic_i += 1
@@ -121,7 +125,7 @@ def simulate(pid, condition, order, seed, start_epoch_ms):
                 if rng.random() < 0.12:
                     add("bot_interrupted", t + 4.2, ph, heard="wait, actually", spoken_chars=24, text_chars=70)
                 add("bot_message", t + 3.8, ph, text=rng.choice(BOT[ph["strategy"]]), kind="reply", engine_used="llm", strategy_used=ph["strategy"])
-                if turns % 4 == 0:
+                if turns % 6 == 0:
                     add("topic_start", t + 22, ph, topic=TOPICS[topic_i % len(TOPICS)])
                     add("bot_message", t + 22, ph, text="Next topic: " + TOPICS[topic_i % len(TOPICS)], kind="opener", engine_used="fixed")
                     topic_i += 1
@@ -164,7 +168,7 @@ def main():
     for i in range(args.n):
         pid = f"SIM-{i + 1:03d}"
         start = now - (args.n - i) * 86_400_000 + 3_600_000 * (i % 5)
-        events = simulate(pid, CONDITIONS[i % 3], ORDERS[i % 6], seed=1000 + i, start_epoch_ms=start)
+        events = simulate(pid, CONDITIONS[i % 3], ORDERS[i % len(ORDERS)], seed=1000 + i, start_epoch_ms=start)
         folder = DATA / pid
         folder.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(start / 1000))

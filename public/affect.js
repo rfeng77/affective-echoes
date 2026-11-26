@@ -40,7 +40,7 @@
     constructor(cfg, onLog) {
       this.cfg = cfg;
       this.onLog = onLog || (() => {});
-      this.face = { v: 0, a: 0, conf: 0, t: 0, expressions: null };
+      this.face = { v: 0, a: 0, conf: 0, t: 0, expressions: null, box: null };
       this.voice = { v: 0, a: 0, conf: 0, t: 0, rmsDb: null, pitch: null };
       this.text = { v: 0, a: 0, conf: 0, t: 0 };
       this.external = { v: 0, a: 0, conf: 0, t: 0, label: null, connected: false };
@@ -57,7 +57,8 @@
       try {
         await faceapi.nets.tinyFaceDetector.loadFromUri(modelPath);
         await faceapi.nets.faceExpressionNet.loadFromUri(modelPath);
-        this.faceOpts = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.4 });
+        // Lower detector cutoff to keep smaller/lower-contrast webcam faces in view.
+        this.faceOpts = new faceapi.TinyFaceDetectorOptions({ inputSize: 224, scoreThreshold: 0.2 });
         this.faceReady = true;
         this._faceLoop();
         return true;
@@ -65,6 +66,14 @@
         console.error("Face model failed to load", e);
         return false;
       }
+    }
+
+    stopFace() {
+      this.faceReady = false;
+      this.video = null;
+      this.face.expressions = null;
+      this.face.conf = 0;
+      this.face.box = null;
     }
 
     async _faceLoop() {
@@ -78,9 +87,13 @@
               const va = EXPR_VA[k];
               if (va) { v += p * va[0]; a += p * va[1]; }
             }
-            this.face = { v, a, conf: r.detection.score, t: performance.now(), expressions: r.expressions };
+            const box = r.detection.box;
+            this.face = {
+              v, a, conf: r.detection.score, t: performance.now(), expressions: r.expressions,
+              box: { x: box.x, y: box.y, width: box.width, height: box.height, frameWidth: this.video.videoWidth, frameHeight: this.video.videoHeight },
+            };
           } else {
-            this.face.conf = 0;
+            this.face = { ...this.face, conf: 0, t: performance.now(), expressions: null, box: null };
           }
         }
       } catch (e) { /* skip frame */ }

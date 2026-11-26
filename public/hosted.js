@@ -202,8 +202,7 @@
     const tb = $("#btnTestDevices"); if (tb) tb.lastChild.textContent = "Check speech input";
     const dpSub = $(".dp-head p"); if (dpSub) dpSub.textContent = "Estimated from your words";
     const steps = document.querySelectorAll(".steps li");
-    if (steps[1]) steps[1].innerHTML = "<strong>Short conversations.</strong> Talk with Alex by typing, or press the microphone, speak, and press it again when you're done. Alex waits until you've finished, and stops to listen when you press the microphone.";
-    const ti = $("#textInput"); if (ti) ti.placeholder = "Type, or press the mic to talk…";
+    if (steps[1]) steps[1].innerHTML = "<strong>Short conversations.</strong> Speak with Alex as you would on a video call. Replies must be spoken; typing is disabled. Press the microphone to speak, then press it again when you're done.";
     const rail = $(".rail-note"); if (rail) rail.innerHTML = "Sessions save privately to your account on this page, and can be downloaded at the end.";
     // Review
     const ex = $("#btnExample"); if (ex) ex.classList.remove("hidden");

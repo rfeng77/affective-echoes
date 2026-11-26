@@ -85,9 +85,6 @@
         <h1>New session</h1>
         <p>Set this up before the participant sits down.</p>
       </div>
-      <button class="btn btn-quiet" id="btnDemo" type="button" title="Short version for walkthroughs: skips rest and practice, runs 5× faster, data marked as demo">
-        <svg class="ico"><use href="#i-spark"/></svg>Load demo preset
-      </button>
     </header>
 
     <div class="setup-body">
@@ -119,7 +116,7 @@
           </label>
           <label class="field" id="manualOrderField">
             <span class="field-label">Manual order</span>
-            <input id="manualOrder" value="anger,shame,pride" spellcheck="false" />
+            <input id="manualOrder" value="anger,pride" spellcheck="false" />
           </label>
           <div class="suggest hidden" id="suggest" role="note">
             <p id="suggestText"></p>
@@ -149,11 +146,8 @@
             </select>
           </label>
           <label class="field field-wide">
-            <span class="field-label">Participant answers by</span>
-            <select id="inputMode">
-              <option value="voice">Speaking or typing</option>
-              <option value="text">Typing only</option>
-            </select>
+            <span class="field-label">Participant response mode</span>
+            <div class="field-note">Speaking only. Press the microphone to start and finish each spoken answer; typing is disabled.</div>
           </label>
         </div>
       </section>
@@ -198,8 +192,8 @@
           <ul class="checks" id="serverStatus">
             <li id="chkServer" data-state="pending"><span class="dot"></span><span class="ck-name">Local server</span><span class="ck-detail">Checking…</span></li>
             <li id="chkModel" data-state="pending"><span class="dot"></span><span class="ck-name">Language model</span><span class="ck-detail">Checking…</span></li>
-            <li id="chkSpeech" data-state="pending"><span class="dot"></span><span class="ck-name">Speech recognition</span><span class="ck-detail">Checking…</span></li>
-            <li id="chkFace" data-state="pending"><span class="dot"></span><span class="ck-name">Face model</span><span class="ck-detail">Checking…</span></li>
+            <li id="chkSpeech" data-state="pending"><span class="dot"></span><span class="ck-name">Local speech transcription</span><span class="ck-detail">Checking…</span></li>
+            <li id="chkFace" data-state="pending"><span class="dot"></span><span class="ck-name">Multimodal emotion model</span><span class="ck-detail">Checking…</span></li>
             <li id="chkCamera" data-state="idle"><span class="dot"></span><span class="ck-name">Camera</span><span class="ck-detail">Not tested yet</span></li>
             <li id="chkMic" data-state="idle"><span class="dot"></span><span class="ck-name">Microphone</span><span class="ck-detail">Not tested yet</span></li>
           </ul>
@@ -244,11 +238,11 @@
       <span class="brand-name">Affective Echoes</span>
     </div>
     <h1 class="intro-title">Welcome, and thank you for taking part.</h1>
-    <p class="intro-lede">Over the next half hour you'll have a few short conversations with Alex, an AI conversation partner, about everyday topics.</p>
+    <p class="intro-lede">Over the next half hour, you'll have two conversation blocks with Alex about several everyday topics.</p>
 
     <ol class="steps">
-      <li><strong>A quiet moment first.</strong> You'll sit and rest for a few minutes while the equipment settles.</li>
-      <li><strong>Short conversations.</strong> Talk with Alex as you would on a video call. Speak normally or type. Alex waits until you've finished, and stops to listen if you start talking.</li>
+      <li><strong>A quiet moment first.</strong> You'll sit and rest for one minute while the equipment settles.</li>
+      <li><strong>Short conversations.</strong> Speak with Alex as you would on a video call. Replies must be spoken; typing is disabled. Please speak for at least 10 seconds in each answer so the emotion model has enough context. Alex waits until you've finished and stops to listen if you start talking.</li>
       <li><strong>Quick check-ins.</strong> Now and then a few sliders will ask how you feel. The conversation pauses while you answer. There are no right or wrong answers.</li>
       <li><strong>Short breaks.</strong> A note at the top of the screen lets you know before each break.</li>
     </ol>
@@ -298,44 +292,35 @@
   </div>
 
   <div class="stage">
-    <!-- Main column: what Alex says + the conversation -->
+    <!-- Main column: Alex's face is the primary visual -->
     <div class="main-col">
-      <div class="subtitle" id="subtitle">
-        <span class="subtitle-who">Alex</span>
-        <p class="subtitle-text" id="subtitleText">…</p>
+      <div class="tile bot-tile" id="botTile" data-emotion="neutral">
+        <div class="avatar" id="avatar" aria-label="Alex, AI conversation partner">
+          <img id="avatarFace" class="emoji-face" src="vendor/minicons-animated/neutral.svg" alt="Alex's neutral expression" />
+        </div>
+        <div class="tile-label"><span>Alex</span><small>AI partner</small></div>
+        <div class="bot-status" id="botStatus" aria-live="polite"></div>
       </div>
 
       <div class="chat-panel" id="chatPanel">
         <div class="chatbox" id="chatbox"></div>
         <div class="live-transcript" id="liveTranscript" aria-live="off"></div>
         <div class="input-row">
-          <button class="mic" id="micBtn" type="button" title="Microphone" aria-label="Microphone on or off">
+          <button class="mic" id="micBtn" type="button" title="Start your spoken answer" aria-label="Start your spoken answer">
             <svg class="ico"><use href="#i-mic"/></svg>
           </button>
-          <input id="textInput" placeholder="Type or speak your answer…" autocomplete="off" aria-label="Your answer" />
-          <button class="btn btn-primary btn-send" id="sendBtn" type="button" aria-label="Send">
-            <span>Send</span><svg class="ico"><use href="#i-send"/></svg>
-          </button>
+          <p class="voice-only-hint" id="voiceOnlyHint">Alex will ask a question. Press the microphone to answer, then press it again when you finish.</p>
         </div>
 
-        <!-- Check-in dialog covers the chat while it is open -->
-        <div class="probe-layer" id="probeLayer"></div>
       </div>
     </div>
 
-    <!-- Side column: video tiles + direct feedback -->
+    <!-- Side column: participant camera + direct feedback, when assigned -->
     <aside class="side-col">
-      <div class="tile bot-tile" id="botTile">
-        <div class="avatar" id="avatar" aria-hidden="true">
-          <span class="ring r3"></span><span class="ring r2"></span><span class="ring r1"></span>
-          <span class="core"></span>
-        </div>
-        <div class="tile-label"><span>Alex</span><small>AI partner</small></div>
-        <div class="bot-status" id="botStatus" aria-live="polite"></div>
-      </div>
-
-      <div class="tile self-tile">
+      <div class="tile self-tile" id="selfTile" data-face-state="waiting">
         <video id="selfVideo" autoplay muted playsinline></video>
+        <div class="face-overlay" id="faceOverlay" aria-hidden="true"><div class="face-box" id="faceBox"></div></div>
+        <div class="face-status" id="faceStatus" role="status" aria-live="polite">Face detection starts with the session</div>
         <div class="tile-label"><span>You</span></div>
       </div>
 
@@ -343,25 +328,21 @@
       <div class="direct-panel hidden" id="directPanel">
         <div class="dp-head">
           <h2>Your affect right now</h2>
-          <p>Estimated from your face, voice and words</p>
+          <p>Light-MER estimate · may be inaccurate</p>
         </div>
         <div class="dp-row">
           <div class="dp-label" id="dpLabel">neutral</div>
-          <svg class="dp-grid" viewBox="0 0 100 100" aria-hidden="true">
-            <rect x="4" y="4" width="92" height="92" rx="8" class="dp-frame"/>
-            <line x1="50" y1="8" x2="50" y2="92"/><line x1="8" y1="50" x2="92" y2="50"/>
-            <text x="90" y="46" text-anchor="end">+</text><text x="10" y="46">−</text>
-            <text x="54" y="16">high</text><text x="54" y="90">low</text>
-            <circle id="dpDot" cx="50" cy="50" r="6"/>
-          </svg>
-        </div>
-        <div class="dp-bars">
-          <div><span>Pleasantness</span><span class="bar"><b id="dpVal"></b></span><em id="dpValNum">0.00</em></div>
-          <div><span>Activation</span><span class="bar"><b id="dpAro"></b></span><em id="dpAroNum">0.00</em></div>
+          <p id="dpStatus" aria-live="polite">Waiting for the first analysis window…</p>
         </div>
       </div>
     </aside>
   </div>
+  <div class="subtitle" id="subtitle" aria-live="polite">
+    <span class="subtitle-who">Alex</span>
+    <p class="subtitle-text" id="subtitleText">…</p>
+  </div>
+  <!-- Check-in dialog covers the conversation screen while it is open -->
+  <div class="probe-layer" id="probeLayer"></div>
 </section>
 
 <!-- ============ BREAK ============ -->

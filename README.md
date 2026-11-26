@@ -2,7 +2,7 @@
 
 A local web app that runs the full Affective Echoes session: a video-call style
 conversation with an AI partner ("Alex"), real-time multimodal affect detection,
-the three feedback conditions, the four response strategies, in-chat emotion
+the three feedback conditions, the Neutral, Anger and Pride response strategies, in-chat emotion
 probes, and time-stamped logging for alignment with EmotiBit / EEG.
 
 It has three views, linked from the sidebar (or the bottom bar on a phone):
@@ -17,10 +17,9 @@ It has three views, linked from the sidebar (or the bottom bar on a phone):
 
 The interface is designed to look polished without becoming part of the stimulus:
 
-- **Affect-neutral palette.** Participant screens use cool, low-saturation greys and one
-  muted blue for actions. Colour is itself an emotional cue, so the only place colour
-  responds to emotion is the subtitle window in the other-mediated condition. Participant
-  screens don't use red, including on the Stop button.
+- **Restrained palette.** Participant screens use cool, low-saturation greys and one
+  muted blue for actions. Subtitle color and the AI emoji face respond to emotion only in
+  the other-mediated condition. Participant screens don't use red, including on Stop.
 - **Static rest and break screens.** They have no breathing or pulsing animation, because
   paced breathing would change the heart-rate data EmotiBit records.
 - **Identical for every participant.** The app ignores the computer's dark-mode setting.
@@ -31,8 +30,11 @@ The interface is designed to look polished without becoming part of the stimulus
 - **Comfortable on any device.** Tap targets are at least 44 px, hover effects only apply
   on devices with a mouse, and motion is switched off for people who've asked their
   computer to reduce it.
-- **Alex is an abstract presence.** Concentric rings with no face (so no facial
-  expression) ripple outward only while Alex speaks. The same echo mark is the logo.
+- **Alex uses native animated face artwork.** The mouth belongs to each illustration; there is no
+  separately overlaid mouth. Expression artwork changes only in Other-mediated projection, and
+  Alex's face is static while the participant speaks.
+- **Preview the expression artwork:** open `/emotion-preview.html` while the local server is
+  running. The animated SVG faces are stored locally under their MIT license.
 - **Experimenter vs participant.** Experimenter areas (setup sidebar, end-screen strip,
   Ctrl+Shift+E panel) use a dark graphite treatment, so it's obvious which screens are
   meant for whom.
@@ -62,8 +64,19 @@ warns about the .bat file, click **More info** → **Run anyway**.
 disk space, webcam and microphone. A graphics card is used automatically when there is one
 (Vulkan); otherwise the model runs on the processor. Replies take about 2–10 seconds.
 
-> Speech-to-text uses the browser's built-in recognizer, which needs an internet connection.
-> Everything else, including Alex's AI, runs on the computer.
+> Participant replies are voice-only; typing is disabled. In the integrated Mac setup,
+> speech-to-text and multimodal emotion detection use the local Whisper and Light-MER service.
+
+For emotion-modulated feedback, participants are asked to speak for at least ten seconds before
+ending each answer. The microphone keeps listening if they try to finish early, while the Stop
+button remains available at all times. The multimodal estimate combines Light-MER with local
+face-expression, conversational-text, and voice-emotion models. It pools up to four short model
+windows from the same answer to reduce label flicker, then surfaces the strongest non-neutral cue
+as subtle unless repeated windows or independent channels support it. The raw fused winner and
+per-channel scores are retained separately for review. These are exploratory estimates, not
+verified statements about a participant's feelings. Adjust
+`affect.minFeedbackSeconds` in `public/config.js` if the study protocol requires a different
+minimum.
 
 ### Running from source (developers)
 
@@ -92,24 +105,23 @@ see §7.
 
 Without an API key the app still runs, using the scripted fallback lines in `config.js`.
 
-> Speech-to-text uses Chrome's built-in recognizer, which needs an internet connection.
-> If the lab is offline, set *Participant input* to "Typing only".
+> The integrated local emotion detector is currently started by the Mac launcher from the
+> sibling `emotion_detector` folder. The detector and local Whisper must report ready before
+> a participant session can start; typing is disabled.
 
 ---
 
 ## 2. Running a session
 
 1. **Setup screen (experimenter)** — enter Participant ID, pick the feedback condition,
-   choose the block order (default: Latin square from the ID number, so P001…P006 cycle
-   through all six orders), click **Test camera and microphone**, then **Start session**.
+   choose the block order (default: counterbalanced by participant ID between Anger→Pride
+   and Pride→Anger), click **Test camera and microphone**, then **Start session**.
    - **Suggested next participant:** the console suggests the next ID and the condition
      with the fewest completed sessions, so groups stay balanced. **Use suggestion** fills
      both in. Demos and simulated sessions don't count.
    - **Before you start checklist:** consent, EmotiBit, EEG/LabRecorder and headphones.
      Ticked items are saved with the session. If consent, EmotiBit or EEG is unticked,
      the first click on Start only warns you, and a second click (**Start anyway**) starts.
-   - **Load demo preset:** a 7-minute version for walkthroughs (no rest or practice, 5×
-     speed). Its data is saved under a `DEMO-` ID and tagged as a demo everywhere.
    - Closing or reloading the tab mid-session asks for confirmation first.
 2. **Instructions** — participant reads them (includes the "attend to your emotions"
    instruction and exit rules) and clicks *I'm ready*.
@@ -117,20 +129,21 @@ Without an API key the app still runs, using the scripted fallback lines in `con
 
 | Phase | Duration | Bot strategy | Probes |
 |---|---|---|---|
-| Resting baseline (fixation cross) | 5 min | — | no |
+| Resting baseline (fixation cross) | 1 min | — | no |
 | Practice | 2 min | Neutral | no |
-| **Block × 3** (one per Anger / Shame / Pride): | | | |
-| ↳ Neutral baseline | 2 min | Neutral | no |
-| ↳ Condition interaction | 5 min | Anger *or* Shame *or* Pride | every 60–120 s (random) |
-| ↳ Neutral recovery | 2 min | Neutral | no |
+| **Block × 2** (one per Anger / Pride): | | | |
+| ↳ Neutral baseline | 1 min | Neutral | no |
+| ↳ Condition interaction | 10 min | Anger *or* Pride, with several topics | every 60–120 s (random) |
+| ↳ Neutral recovery | 1 min | Neutral | no |
 | ↳ Break (not after last block) | 1 min | — | no |
 
-App time ≈ 36 min; pre/post questionnaires make up the rest of the 65–75 min.
+App time ≈ 28 min; pre/post questionnaires make up the rest of the 65–75 min.
 
-**Screen layout:** the conversation (subtitle window + chat) takes up most of the screen.
-Alex and the participant's camera are two small, equal-sized tiles on the right. Alex is
-a set of rings with no face, which ripple only while Alex speaks, and a small status tag
-shows *Speaking*, *Listening…*, *Thinking…* or *Paused*. A thin bar at the top shows how
+**Screen layout:** Alex's emoji-style face is the main view. Subtitles appear below it,
+and the participant's camera appears in a smaller tile in the side column. The emoji face
+only changes expression in the other-mediated condition; in the other conditions only its
+mouth moves while speaking. A small status tag shows *Speaking*, *Listening…*, *Thinking…*
+or *Paused*. A thin bar at the top shows how
 far through the session the participant is, without naming any strategy. On a phone,
 check-ins slide up from the bottom of the screen.
 
@@ -168,7 +181,7 @@ Open **Sessions and review** (`/review.html`) while the server is running.
 - **Summary:** length, check-ins answered, mean agreement, report–estimate correlation for
   pleasantness and activation, and interruptions.
 - **Affect over the session:** the system's estimated pleasantness and activation as lines,
-  each check-in's reported values as dots (rescaled to −1…+1), and the Anger, Shame, Pride,
+  each check-in's reported values as dots (rescaled to −1…+1), and the Anger, Pride,
   rest and break periods shaded behind them. Hover for exact values; click to jump the
   transcript to that moment.
 - **Check-ins:** each report next to the estimate averaged over the 30 s before the
@@ -199,7 +212,7 @@ measured. Remove them with `--clean` before real data collection.
 `/overview.html` explains the study for judges and visitors. Its main feature is a live
 preview: drag a point on a pleasantness × activation grid and see exactly what a
 participant would see in each feedback condition. The page also covers the session flow,
-the system's parts with Alex's four response styles, and the design choices that keep the
+the system's parts with Alex's response styles, and the design choices that keep the
 interface from becoming part of the stimulus.
 
 ---
@@ -208,45 +221,60 @@ interface from becoming part of the stimulus.
 
 | Condition | What the participant sees |
 |---|---|
-| **Other-mediated projection** | Detected affect is folded into the bot's words (e.g. "you sound a little tense about this") **and** tints the subtitle window — rose for negative, warm amber for positive, stronger border and slow pulse for high arousal. No labels or numbers ever shown. |
-| **Direct feedback** | A panel shows "Your current affect (estimated)": label, valence/arousal bars, and a dot on a 2-D grid. Bot words contain no echo. |
-| **No feedback** | Identical interaction, no affect display, no echo. |
+| **Other-mediated projection** | Alex speaks the ordinary reply. A local rule rewrites only its subtitle with emotional phrasing, punctuation and emoji, while Alex's animated face expresses the selected affect cue. No spoken emotion attribution or label is shown. |
+| **Direct feedback** | A panel shows the selected emotion cue. Alex's animated neutral face remains neutral while speaking. |
+| **No feedback** | No affect display or emotion-styled subtitle. Alex's animated neutral face remains neutral while speaking. |
 
-Detection runs and is logged in **all** conditions, so the analysis can compare
-estimate–self-report alignment across conditions.
+The same local face, voice, transcript and Light-MER models process answer windows in all
+conditions. Press the microphone to start answering and press it again to finish; Alex waits for
+the answer before responding. Local Whisper supplies the English transcript. Face-api.js runs in
+the browser only after the camera is enabled, and its expression scores are pooled with the
+Light-MER answer windows. A sensitivity-first threshold allows weak, sustained facial cues such as
+a small smile to affect the next response; these exploratory labels can be wrong and are not
+calibrated probabilities. Only the answer's selected affect cue styles Alex's next subtitle and
+face in Other-mediated. The active induction target is logged separately and can influence the
+displayed cue only after Alex completes a strategy-specific stimulating reply; raw estimates remain
+available in the event log. The Minicons Animated SVG assets are included locally under the MIT
+License; see `public/vendor/minicons-animated/NOTICE.txt`. Build-5
+continues to save its transcript and event logs locally. In the Mac setup, keep the
+`emotion_detector` folder beside `affective-echoes-build-5`; its launcher starts the local
+service on `127.0.0.1:8770` if it is not already running. Camera and microphone processing
+starts only after the researcher clicks **Start session**; answer audio is sent for analysis
+only while the participant has the microphone button active.
 
 ---
 
 ## 5. Response strategies
 
-Defined in `public/config.js` → `strategies`. Each is a fixed system prompt plus shared
-safety rules (short replies, low-risk topics, no personal insults, scripted exit line if the
-participant wants to stop). Each also has a **fallback** bank used if the LLM is unreachable.
+Defined in `public/config.js` → `strategies`. The experiment now has two emotional strategies:
+issue-focused Anger and specific, enthusiastic Pride; Neutral is used for practice, baseline and
+recovery. The same spoken strategy is used in every feedback condition; only the feedback display
+differs. Each strategy also has a **fallback** bank used if the LLM is unreachable. Alex never
+criticizes the participant personally, and the participant can stop at any time.
 Every bot message is logged with the strategy and engine (`llm` / `scripted` / `fixed`) that
 produced it, and LLM messages include the exact system prompt used.
 
-The bot opens every phase with a new topic from `topics`, and moves to the next topic after
-4 replies or 60 s of silence (counted from when Alex stops speaking).
+Each topic stays active for at least six completed participant-answer / AI-reply rounds. Alex
+follows up on the participant's answer throughout those rounds, then opens another topic within
+the same emotion block. A pause does not trigger a topic change. The 10-minute Anger and Pride
+blocks are designed to allow several topics under each strategy.
 
 **Keeping the built-in model on protocol.** The prompts were tuned against the real Llama 3.2 3B:
-- **Shame:** Alex's first reply in each Shame part is the fixed standard question ("what standard
-  do you hold yourself to in discussions like this?"), logged with `line: "standard_question"`.
-  Later replies point out the gap between that standard and the participant's answers.
-- **Anger and Shame** prompts give the model concrete opening lines, because a small model left to
+- **Anger:** Alex challenges the claim and asks the participant to defend it across several turns.
+- **Pride:** Alex gives specific, enthusiastic praise for the participant's current contribution.
+- **Anger** prompts give the model concrete examples, because a small model left to
   itself tends to soften criticism into praise.
-- **Other-mediated echo:** the echo instruction comes last in the prompt, where small models follow it
-  most reliably. If a reply still leaves out the reflection, or reflects the wrong feeling, the app
-  adds the same scripted reflection the fallback lines use (for example "You sound a little tense
-  about this.") and logs `echo_added: true`, so every participant in that condition gets the echo.
-  The pause line is never changed.
+- **Other-mediated styling:** the model generates and speaks the ordinary reply. After the
+  participant finishes, local rules style only the next visible subtitle and change the emoji
+  face. The app does not ask the chatbot to name or comment on the participant's emotion.
 
 ### Turn-taking
 
-- **Waiting for the participant:** a spoken answer only counts as finished after 2.5 s of
-  silence, so short pauses mid-thought don't trigger a reply. Alex then waits a further
-  1.2 s before speaking. In total Alex starts about 3.5–4 s after the participant stops.
-- **Holding replies:** Alex never starts talking while the participant is speaking or
-  typing. If the participant adds more while a reply is being prepared, that reply is
+- **Waiting for the participant:** Alex asks a question and waits with the microphone off.
+  The participant presses the mic to answer, then presses it again to submit. Local
+  transcription and emotion analysis finish before Alex prepares the next reply.
+- **Holding replies:** Alex never starts talking while the participant is speaking. If
+  the participant adds more while a reply is being prepared, that reply is
   dropped and a new one is written that covers everything they said.
 - **Pausing to listen (barge-in):** if the participant starts talking while Alex is speaking,
   Alex stops mid-sentence and listens. The full line stays in the subtitle window. Speech
@@ -257,10 +285,10 @@ The bot opens every phase with a new topic from `topics`, and moves to the next 
 
 ### Check-ins
 
-A check-in appears as a dialog over the chat. While it's open the chat is **locked**:
-the text box, Send and mic are disabled, speech recognition is switched off, and any reply
-Alex was preparing waits until the check-in closes. A due check-in waits up to 10 s for a
-natural gap (Alex finished speaking, participant finished talking) before appearing.
+A check-in appears as a dialog over the chat. While it's open the chat and microphone are
+**locked**, and any reply Alex was preparing waits until the check-in closes. A due check-in
+waits up to 10 s for a natural gap (Alex finished speaking, participant finished talking)
+before appearing.
 
 Each question is a slider with numbered tick marks and labeled ends. Sliders start with
 **no answer selected** (no handle shown) to avoid anchoring at the midpoint; the
@@ -339,16 +367,17 @@ features every 500 ms and every transcript, and uses your model's
 | `probes.maxDeferSec / minRemainingSec` | 10 / 15 |
 | `conversation.endOfUtteranceMs` | 2500 (silence that ends a spoken answer) |
 | `conversation.minReplyDelayMs` | 1200 (extra pause before Alex replies) |
-| `conversation.typingHoldMs` | 2500 |
 | `conversation.silenceNudgeSec` | 60 |
 | `conversation.ttsRate` | 0.95 |
 | `conversation.bargeIn` | true (set false to keep the mic off while Alex speaks) |
 | `transitions.noticeLeadSec / quietTailSec` | 30 / 8 |
 | `transitions.breakNotice / endNotice` | banner wording |
 | `affect.sampleMs` | 500 |
-| `topics` | 12 everyday low-risk topics |
+| `topics` | 17 everyday low-risk topics |
+| `conversation.minTurnsPerTopic` | 6 completed answer / reply rounds |
+| `timing.blockCondition` | 10 min per strategy |
 | `strategies.*.prompt / fallback` | strategy prompts and scripted lines |
-| `conditions.other_mediated.echoPrompt` | how the echo is woven into replies |
+| other-mediated subtitle rules | local subtitle and emoji-face styling from the participant's last clear answer emotion |
 | `probeItems` | probe questions, slider range and `step` |
 
 LLM provider and model are set in `.env` (Anthropic by default; any OpenAI-compatible
@@ -366,8 +395,8 @@ endpoint also works).
 - **Pride example:** the slide's "You're doing a lot better than the other students"
   breaks the strategy's own "no derogatory comparisons" rule, so it is excluded from the
   prompt and the prompt forbids comparisons.
-- **Deception and debrief:** the Anger and Shame strategies give scripted negative
-  feedback. A short debrief screen is included; check its wording against your IRB protocol.
+- **Deception and debrief:** Anger gives critical, argument-focused replies and Pride gives
+  enthusiastic praise. A short debrief screen is included; check its wording against your IRB protocol.
 - Keep the browser window **full-screen and focused** during sessions — background tabs
   throttle timers.
 

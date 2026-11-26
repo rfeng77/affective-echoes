@@ -22,23 +22,34 @@
     startPerf: 0, startEpoch: 0,
     events: [], affect: [], probes: [], transcript: [],
     phases: [], phaseIdx: -1, phaseElapsed: 0, paused: false, lastTick: 0,
-    strategy: "neutral", topicIdx: 0, topic: "", turnsOnTopic: 0,
-    history: [], busy: false, openingTopic: false,
+    strategy: "neutral", strategyStimulusDelivered: false, topicIdx: 0, topic: "", turnsOnTopic: 0, topicChangePending: false,
+    pendingRoundCompletion: false,
+    history: [], busy: false,
     // turn-taking
     lastUserAt: 0, lastCommitAt: 0, userSeq: 0,
-    voiceActiveUntil: 0, typingUntil: 0,
+    voiceActiveUntil: 0,
     botSpeaking: false, botEndAt: 0, echoGuardUntil: 0, currentBotText: "", ttsChar: 0,
     // probes / transitions
-    nextProbeAt: null, probeDueAt: null, activeProbe: null, probeCount: 0, chatLocked: false,
+    nextProbeAt: null, probeDueAt: null, probeDeferredReason: null, activeProbe: null, probeCount: 0, chatLocked: false,
+    phaseEndPending: false, phaseClosingMode: "none",
     notice: null,
-    lastFeedbackLabel: null, serverOk: false, serverInfo: null,
+    lastFeedbackLabel: null, feedbackEmotionLabel: "neutral", serverOk: false, serverInfo: null,
     pendingLog: [], ended: false, stream: null,
   };
-  let engine = null;            // AffectEngine
-  let fallbackIdx = {};
-
+  let engine = null;            // hosted fallback only
+  let emotionToken = null, emotionCtx = null, emotionProcessor = null, audioSource = null;
+  let sampleQueue = [], sampleCount = 0, sampleQueueStartMs = null, frameTimer = null, submitBusy = false;
+  let windowParticipantAnswer = false, inflightEmotionWindows = 0;
+  // A ten-second spoken answer gives the multimodal estimate context for
+  // next-turn feedback; an explicit Stop remains available throughout.
+  const MIN_EMOTION_FEEDBACK_SAMPLES = (C.affect.minFeedbackSeconds || 10) * 16000;
+  let participantAnswerSamples = 0, participantSpeechSamples = 0;
+  let answerEmotionWindows = [];
+  let faceCueEngine = null, faceCueSampler = null, faceCueHistory = [];
+  let latestEmotion = { label: "uncertain", emotion_terms: [], transcript: "", status: "waiting" };
+  let lastClearEmotion = null, localListening = false, speechBuffer = "", speechTimer = null;
   const curPhase = () => S.phases[S.phaseIdx];
-  const userActive = () => perf() < Math.max(S.voiceActiveUntil, S.typingUntil);
+  const userActive = () => perf() < S.voiceActiveUntil;
 
   // ------------------------------------------------------------------
   // Logging: every event carries epoch ms (for aligning with EmotiBit/EEG
@@ -86,10 +97,7 @@
   // ------------------------------------------------------------------
   // Setup screen
   // ------------------------------------------------------------------
-  const PERMS = [
-    ["anger", "shame", "pride"], ["shame", "pride", "anger"], ["pride", "anger", "shame"],
-    ["anger", "pride", "shame"], ["shame", "anger", "pride"], ["pride", "shame", "anger"],
-  ];
+  const PERMS = [["anger", "pride"], ["pride", "anger"]];
   function computeOrder() {
     const mode = $("orderMode").value;
     if (mode === "manual") {
@@ -165,19 +173,6 @@
   refreshOrderPreview();
   $("appVersion").textContent = `Version ${C.version}`;
 
-  // Demo preset for walkthroughs: short, fast, clearly labelled in the data
-  let demoMode = false;
-  $("btnDemo").onclick = () => {
-    demoMode = true;
-    const d = new Date();
-    $("pid").value = `DEMO-${String(d.getHours()).padStart(2, "0")}${String(d.getMinutes()).padStart(2, "0")}`;
-    $("skipResting").checked = true; $("skipPractice").checked = true;
-    $("speed").value = "5"; $("orderMode").value = "latin";
-    refreshOrderPreview();
-    toast("Demo preset loaded: about 7 minutes, no rest or practice. Data is marked as a demo.");
-  };
-  $("pid").addEventListener("input", () => { if (!/^DEMO-/.test($("pid").value)) demoMode = false; });
-
   // Suggest the next participant: least-run condition, next ID number
   async function loadSuggestion() {
     try {
@@ -197,7 +192,7 @@
         `Completed so far: ${order.map((c) => `${label(c)} ${counts[c]}`).join(", ")}.`;
       $("suggest").classList.remove("hidden");
       $("btnSuggest").onclick = () => {
-        $("pid").value = nextPid; $("condition").value = nextCond; demoMode = false;
+        $("pid").value = nextPid; $("condition").value = nextCond;
         refreshOrderPreview();
       };
     } catch (e) { /* server not running: no suggestion */ }
@@ -278,15 +273,30 @@
     setCheck("chkFace", "warn", "Not used in the hosted demo");
     setCheck("chkCamera", "warn", "Not available in the hosted demo");
     H.ready.then(() => {
-      setCheck("chkSpeech", H.dict ? "ok" : "warn", H.dict ? "Push-to-talk available" : "Not available here, typing only");
-      setCheck("chkMic", H.dict ? "ok" : "warn", H.dict ? "Used through push-to-talk" : "Typing only");
+      setCheck("chkSpeech", H.dict ? "ok" : "bad", H.dict ? "Spoken replies available" : "Voice input unavailable; session cannot start");
+      setCheck("chkMic", H.dict ? "ok" : "bad", H.dict ? "Push-to-talk ready" : "Voice input unavailable");
     });
   } else {
-    setCheck("chkSpeech", (window.SpeechRecognition || window.webkitSpeechRecognition) ? "ok" : "warn",
-      (window.SpeechRecognition || window.webkitSpeechRecognition) ? "Available" : "Not supported here. Use Chrome, or typing only");
-    fetch("vendor/models/face_expression_model-weights_manifest.json", { method: "HEAD" })
-      .then((r) => setCheck("chkFace", r.ok ? "ok" : "bad", r.ok ? "Ready" : "Model files missing"))
-      .catch(() => setCheck("chkFace", "bad", "Model files missing"));
+    setCheck("chkSpeech", "pending", "Waiting for local Whisper…");
+    setCheck("chkFace", "pending", "Loading Light-MER…");
+    let emotionHealthTimer = null, emotionHealthBusy = false;
+    const checkEmotionHealth = async () => {
+      if (emotionHealthBusy) return;
+      emotionHealthBusy = true;
+      try {
+        const r = await fetch("/api/emotion/health", { cache: "no-store" });
+        const d = await r.json();
+        const ready = r.ok && d.status === "ready" && d.models && d.models.joint === "lightmer_stage2";
+        setCheck("chkSpeech", ready ? "ok" : "pending", ready ? "Local Whisper ready" : "Waiting for local Whisper…");
+        setCheck("chkFace", ready ? "ok" : "pending", ready ? "Light-MER Stage 2 ready" : "Loading Light-MER…");
+        if (ready && emotionHealthTimer) { clearInterval(emotionHealthTimer); emotionHealthTimer = null; }
+      } catch (_) {
+        setCheck("chkSpeech", "pending", "Waiting for local emotion service…");
+        setCheck("chkFace", "pending", "Start the Mac launcher if this continues");
+      } finally { emotionHealthBusy = false; }
+    };
+    checkEmotionHealth();
+    emotionHealthTimer = setInterval(checkEmotionHealth, 3000);
   }
 
   // Live microphone level on the setup screen
@@ -320,7 +330,7 @@
     if (HOSTED) {
       await H.ready;
       toast(H.dict ? "Speech input works by push-to-talk: press the microphone during the conversation, speak, then press it again."
-                   : "Speech input isn't available in this browser. Participants can type their answers.");
+                   : "Spoken input is unavailable here. Use a supported browser before starting; typing is disabled.");
       return;
     }
     try {
@@ -343,10 +353,16 @@
   };
 
   $("btnStart").onclick = async () => {
+    if (HOSTED) await H.ready;
+    const speechAvailable = HOSTED ? !!(H && H.dict) : await localEmotionReady();
+    if (!speechAvailable) {
+      toast("The local Light-MER and Whisper service must be ready before this voice-only session can start.");
+      return;
+    }
     S.pid = $("pid").value.trim();
     if (!S.pid) { toast("Enter a participant ID to start the session."); $("pid").focus(); return; }
     const open = checklistBoxes().filter((b) => !b.checked && b.dataset.key !== "headphones");
-    if (open.length && !startArmed && !demoMode) {
+    if (open.length && !startArmed) {
       startArmed = true;
       $("btnStart").textContent = "Start anyway";
       toast(`Not checked yet: ${open.map((b) => b.parentElement.querySelector("strong").textContent.toLowerCase()).join(", ")}. Click Start anyway to continue.`);
@@ -356,7 +372,7 @@
     S.order = randomCache || computeOrder();
     S.engine = $("engine").value;
     S.tts = $("tts").value === "on";
-    S.inputMode = $("inputMode").value;
+    S.inputMode = "voice";
     S.speed = parseFloat($("speed").value);
 
     $("btnStart").disabled = true; $("btnStart").textContent = HOSTED ? "Starting…" : "Loading models…";
@@ -374,25 +390,31 @@
     if (S.stream) $("selfVideo").srcObject = S.stream;
 
     S.startPerf = perf(); S.startEpoch = Date.now();
-    engine = new window.AffectEngine(C.affect, (t, d) => log(t, d));
-    const faceOk = HOSTED ? false : await engine.initFace($("selfVideo"), "vendor/models");
-    const voiceOk = HOSTED ? false : engine.initVoice(S.stream);
-    if (!HOSTED && C.affect.useExternalModel) engine.connectExternal(C.affect.externalModelUrl);
+    if (!HOSTED) {
+      await startClientFaceCueDetector();
+      try {
+        const sr = await fetch("/api/emotion/session", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+        const sd = await sr.json();
+        if (!sr.ok || !sd.token) throw new Error(sd.error || "session setup failed");
+        emotionToken = sd.token; startLocalEmotionCapture();
+      } catch (e) {
+        toast("Could not start the local emotion detector. Check that Light-MER is running, then restart the session.");
+        $("btnStart").disabled = false; $("btnStart").textContent = "Start session"; return;
+      }
+    }
 
     log("session_start", {
       order: S.order.join(">"), engine: S.engine, tts: S.tts, input_mode: S.inputMode, speed: S.speed,
-      face_model: faceOk, voice_features: voiceOk, user_agent: navigator.userAgent,
+      face_model: HOSTED ? "hosted" : "yunet_lightmer + local_face_api_sensitive", voice_features: !HOSTED, emotion_model: HOSTED ? "hosted" : "lightmer_stage2", asr_model: HOSTED ? "hosted dictation" : "local whisper small.en", user_agent: navigator.userAgent,
       llm: S.serverInfo && S.serverInfo.llm ? `${S.serverInfo.llm.provider}/${S.serverInfo.llm.model}` : null,
-      start_epoch_ms: S.startEpoch, config_timing: C.timing, config_probes: C.probes,
-      checklist: checklistState(), demo: demoMode || HOSTED, hosted: HOSTED, app_version: C.version,
+      start_epoch_ms: S.startEpoch, config_timing: C.timing, config_probes: C.probes, config_affect: C.affect,
+      checklist: checklistState(), demo: HOSTED, hosted: HOSTED, app_version: C.version,
       config_conversation: CV, config_transitions: { noticeLeadSec: TR.noticeLeadSec, quietTailSec: TR.quietTailSec },
     });
-    if (!faceOk && !HOSTED) toast("The face model didn't load. Affect will be estimated from voice and words only.");
 
     buildPhases();
     buildProgress();
     setupConditionUI();
-    startSampling();
     $("xPid").textContent = S.pid;
     $("xCond").textContent = C.conditions[S.condition].label;
     showScreen("screen-instructions");
@@ -457,10 +479,20 @@
     hideNotice();
     S.phaseIdx++;
     S.phaseElapsed = 0;
+    S.phaseEndPending = false;
+    S.phaseClosingMode = "none";
     S.probeDueAt = null;
+    S.probeDeferredReason = null;
     if (S.phaseIdx >= S.phases.length) { endSession("completed"); return; }
     const p = curPhase();
+    const previousStrategy = S.strategy;
     S.strategy = p.strategy || "none";
+    S.strategyStimulusDelivered = false;
+    if (S.strategy !== previousStrategy) {
+      const rawLabel = lastClearEmotion?.raw_label;
+      S.feedbackEmotionLabel = rawLabel || "neutral";
+    }
+    log("strategy_condition_started", { previous_strategy: previousStrategy, strategy: S.strategy, condition_target: ["anger", "pride"].includes(S.strategy) ? S.strategy : null, strategy_stimulus_delivered: false, retained_raw_label: lastClearEmotion?.raw_label || null });
     log("phase_start", { duration_s: p.dur, scaled_duration_s: +(p.dur / S.speed).toFixed(2) });
     $("xPhase").textContent = p.id;
     $("xStrat").textContent = S.strategy;
@@ -468,7 +500,6 @@
     if (p.kind === "rest") {
       S.nextProbeAt = null;
       showScreen("screen-rest");
-      engine.startVoiceCalibration();
       setListening(false);
     } else if (p.kind === "break") {
       S.nextProbeAt = null;
@@ -478,16 +509,15 @@
       $("breakNext").textContent = "";
       showScreen("screen-break");
     } else {
-      engine.stopVoiceCalibration();
       showScreen("screen-chat");
       $("phaseTag").textContent = p.label || "Conversation";
       S.nextProbeAt = (p.isCondition || !C.probes.onlyDuringCondition) ? randProbeDelay() : null;
-      setListening(S.inputMode === "voice");
-      if (prev && prev.kind === "chat") openTopicWhenClear();          // continuous chat: don't talk over anyone
-      else newTopic(S.phaseIdx === firstChatPhaseIdx());
+      setListening(HOSTED && S.inputMode === "voice");
+      if (!S.topic) newTopic(true, "session_start");
+      else if (S.topicChangePending) newTopic(false, "minimum_rounds_complete");
+      else log("topic_continued", { topic: S.topic, completed_rounds: S.turnsOnTopic, phase_transition: true });
     }
   }
-  function firstChatPhaseIdx() { return S.phases.findIndex((p) => p.kind === "chat"); }
   function randProbeDelay() { return C.probes.minIntervalSec + Math.random() * (C.probes.maxIntervalSec - C.probes.minIntervalSec); }
 
   function tick(ts) {
@@ -511,26 +541,32 @@
         $("phaseTimer").textContent = txt;
         updateNotice(left);
         tickProbe(left);
-        tickSilence();
       }
       $("xProbe").textContent = S.activeProbe ? "Open now" : S.nextProbeAt != null ? `in ${fmt(Math.max(0, S.nextProbeAt - S.phaseElapsed))}` : "None this phase";
       if (p.kind === "chat") updateProgress();
-      if (S.phaseElapsed >= p.dur) nextPhase();
+      if (S.phaseElapsed >= p.dur) {
+        if (!S.phaseEndPending) {
+          S.phaseEndPending = true;
+          // Finish a participant turn already underway. If Alex just asked a
+          // question, leave the mic available for one answer and its response.
+          if (userActive() || S.activeProbe || submitBusy || inflightEmotionWindows > 0 || S.busy) {
+            S.phaseClosingMode = "finish_turn";
+          } else if (S.botSpeaking) {
+            S.phaseClosingMode = "allow_answer";
+          } else {
+            nextPhase();
+          }
+        }
+        if (S.phaseClosingMode === "finish_turn" && !S.busy &&
+            !S.botSpeaking && !userActive() && !S.activeProbe && !submitBusy && inflightEmotionWindows === 0) {
+          nextPhase();
+        }
+      }
     }
     updateBotStatus();
     requestAnimationFrame(tick);
   }
   function fmt(s) { s = Math.ceil(s); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; }
-
-  // Move to a new topic if nobody has said anything for a while
-  function tickSilence() {
-    if (S.busy || S.openingTopic || S.activeProbe || S.botSpeaking || userActive() || S.notice) return;
-    const idleSince = Math.max(S.lastUserAt, S.botEndAt);
-    if (idleSince && (perf() - idleSince) / 1000 * S.speed > CV.silenceNudgeSec) {
-      log("silence_nudge");
-      newTopic(false);
-    }
-  }
 
   // ------------------------------------------------------------------
   // Transition notices (before breaks and before the session ends)
@@ -572,39 +608,46 @@
   // ------------------------------------------------------------------
   // Conversation
   // ------------------------------------------------------------------
-  function newTopic(isFirst) {
+  function newTopic(isFirst, reason = "minimum_rounds_complete") {
+    const previousTopic = S.topic || null;
+    const completedRounds = S.turnsOnTopic;
+    const minimumRounds = Math.max(1, CV.minTurnsPerTopic || 4);
+    if (!isFirst && previousTopic && completedRounds < minimumRounds) {
+      log("topic_change_blocked_incomplete", { topic: previousTopic, completed_rounds: completedRounds, minimum_rounds: minimumRounds, reason });
+      return false;
+    }
     S.topic = C.topics[S.topicIdx % C.topics.length];
     S.topicIdx++;
     S.turnsOnTopic = 0;
+    S.topicChangePending = false;
+    S.pendingRoundCompletion = false;
     S.lastUserAt = perf();
     const text = isFirst
       ? `Hi, I'm Alex! Let's start with an easy one: ${S.topic}`
       : `Next topic: ${S.topic}`;
-    log("topic_start", { topic: S.topic });
+    log("topic_start", { topic: S.topic, previous_topic: previousTopic, completed_rounds_on_previous: completedRounds, reason });
     botSay(text, { kind: "opener", engine_used: "fixed" });
+    return true;
   }
 
-  // Between two chat phases: wait for Alex to finish and the participant to stop talking
-  async function openTopicWhenClear() {
-    const idx = S.phaseIdx;
-    S.openingTopic = true;
-    const t0 = perf();
-    await waitUntil(() => S.ended || S.phaseIdx !== idx || perf() - t0 > 10000 ||
-      (!S.botSpeaking && !userActive() && !S.activeProbe));
-    S.openingTopic = false;
-    if (S.ended || S.phaseIdx !== idx) return;
-    newTopic(false);
+  function closeTopicReply(text, closingFallback) {
+    // Keep the model's response to the participant, remove any last-turn
+    // follow-up question, and add a clear close before the next topic opens.
+    const statements = String(text || "").match(/[^.!?]+[.!?]*/g) || [];
+    const answer = statements.filter((part) => !part.includes("?")).join(" ").trim();
+    if (!answer) return closingFallback || "Thanks for sharing your view. Let's leave this topic here.";
+    const cleanAnswer = answer.replace(/[.!?…]+\s*$/, "").trim();
+    return `${cleanAnswer}. ${closingFallback || "Let's leave this topic here."}`;
   }
 
   function recordUser(text, extra = {}) {
+    if (S.phaseClosingMode === "allow_answer") S.phaseClosingMode = "finish_turn";
     S.lastUserAt = perf();
     addMsg("user", text);
     S.history.push({ role: "user", content: text });
     S.transcript.push({ ...now(), ...phaseInfo(), speaker: "participant", text });
-    engine.ingestText(text);
-    engine.sendToExternal({ type: "transcript", text, ...now() });
     S.userSeq++;
-    log("user_message", { text, affect: engine.snapshot(), ...extra });
+    log("user_message", { text, affect: getAffectSnapshot(), ...extra });
   }
 
   function handleUser(text, source) {
@@ -615,12 +658,11 @@
     if (S.activeProbe) { log("input_blocked_checkin", { text, input: source }); return; }
     recordUser(text, { input: source });
     S.lastCommitAt = perf();
-    if (S.openingTopic) return;          // the new topic is about to be posed
     respond();
   }
 
   // Generate a reply, then hold it until it's polite to speak:
-  // the participant isn't talking/typing, no check-in is open, a short pause
+  // the participant isn't speaking, no check-in is open, a short pause
   // has passed, and we're not in the last few seconds before a break.
   async function respond() {
     if (S.busy) return;                  // the running loop notices new input via userSeq
@@ -630,11 +672,12 @@
     try {
       while (true) {
         const seq = S.userSeq;
-        const moveOn = S.turnsOnTopic >= CV.turnsPerTopic && !inNoticeWindow();
-        const reply = moveOn ? null : await generateReply();
+        // Keep one topic active through the whole conversation phase. Never
+        // change topics instead of responding to something the participant said.
+        const reply = await generateReply();
         const heldFrom = perf();
         await waitUntil(() => S.ended || S.phaseIdx !== phaseIdx ||
-          (!userActive() && !S.activeProbe && !S.botSpeaking && !inQuietTail() &&
+          (!userActive() && !S.activeProbe && !S.botSpeaking && (!inQuietTail() || S.phaseEndPending) &&
            perf() - S.lastCommitAt >= CV.minReplyDelayMs));
         if (S.ended || S.phaseIdx !== phaseIdx) {
           if (reply) log("reply_discarded", { reason: S.ended ? "session_end" : "phase_changed", text: reply.text });
@@ -645,8 +688,7 @@
           if (reply) log("reply_discarded", { reason: "new_participant_input", text: reply.text });
           continue;
         }
-        if (moveOn) { newTopic(false); return; }
-        S.turnsOnTopic++;
+        S.pendingRoundCompletion = true;
         botSay(reply.text, { ...reply.meta, held_ms: Math.round(perf() - heldFrom), regenerations: regen });
         return;
       }
@@ -655,28 +697,16 @@
 
   async function generateReply() {
     const strat = C.strategies[S.strategy] || C.strategies.neutral;
-    const snapshot = engine.snapshot();
-    let echoPhrase = null;
+    const snapshot = getAffectSnapshot();
     const stratPrompt = strat.prompt;
-    let system = `${C.sharedRules}\n\n${stratPrompt}\n\nCurrent topic: "${S.topic}"`;
-    if (S.condition === "other_mediated") {
-      // The echo goes last: small local models follow the most recent instruction most reliably.
-      echoPhrase = engine.phrase();
-      system += "\n\n" + C.conditions.other_mediated.echoPrompt
-        .replaceAll("{AFFECT_PHRASE}", echoPhrase)
-        .replaceAll("{AFFECT_SHORT}", echoPhrase.split(",")[0]);
-    }
+    const minRounds = Math.max(1, CV.minTurnsPerTopic || 4);
+    const topicRound = Math.min(S.turnsOnTopic + 1, minRounds);
+    const finalRoundRule = topicRound >= minRounds
+      ? "This is the final reply for this topic. Respond specifically to the participant's latest answer, do not ask any question, and end with a brief statement that closes this topic."
+      : "Respond specifically to the latest answer and ask one natural follow-up question about this same topic.";
+    const system = `${C.sharedRules}\n\n${stratPrompt}\n\nConversation lock: Continue the current topic; this is reply round ${topicRound} of at least ${minRounds}. A topic change happens only after the participant has answered and you have completed your reply. ${finalRoundRule} Do not introduce or ask about another subject.\n\nCurrent topic: "${S.topic}"`;
     const t0 = perf();
-    const meta = { kind: "reply", strategy_used: S.strategy, echo_phrase: echoPhrase, affect_at_generation: snapshot };
-    if (strat.firstLine) {             // Shame: ask about the participant's standard first, word for word
-      const phaseId = curPhase()?.id;
-      const asked = S.transcript.some((t) => t.speaker === "bot" && t.phase === phaseId && t.text.includes(strat.firstLine));
-      if (!asked) {
-        const text = (echoPhrase ? scriptedEcho(snapshot.label) : "") + strat.firstLine;
-        return { text, meta: { ...meta, engine_used: "fixed", line: "standard_question", latency_ms: 0 } };
-      }
-    }
-
+    const meta = { kind: "reply", strategy_used: S.strategy, affect_at_generation: snapshot };
     if (S.engine === "llm" && S.serverOk && S.serverInfo && S.serverInfo.llm) {
       try {
         const msgs = trimHistory(S.history.slice(-C.llm.historyTurns * 2));
@@ -686,27 +716,21 @@
         });
         const d = await r.json();
         if (!r.ok || !d.text) throw new Error(d.error || "empty reply");
-        let text = d.text.trim();
-        // Other-mediated condition: make sure the affect reflection reaches the participant even
-        // if the model skipped it, by adding the same scripted sentence the fallback lines use.
-        let echoAdded = false;
-        if (echoPhrase && !isExitLine(text) && !echoPresent(text, snapshot.label)) {
-          const add = scriptedEcho(snapshot.label);
-          if (add) {
-            // drop an opening reflection that names the wrong feeling, then add the right one
-            text = add + (text.replace(OPENING_REFLECTION, "").trim() || text);
-            echoAdded = true;
-          }
-        }
-        return { text, meta: { ...meta, engine_used: "llm", echo_added: echoAdded, latency_ms: Math.round(perf() - t0), system_prompt: system } };
+        const text = topicRound >= minRounds ? closeTopicReply(d.text.trim(), strat.closingFallback) : d.text.trim();
+        return { text, meta: { ...meta, engine_used: "llm", latency_ms: Math.round(perf() - t0), system_prompt: system } };
       } catch (e) {
         log("llm_error", { error: String(e.message || e) });
       }
     }
     const bank = strat.fallback;
-    fallbackIdx[S.strategy] = ((fallbackIdx[S.strategy] ?? -1) + 1) % bank.length;
-    let text = bank[fallbackIdx[S.strategy]];
-    if (echoPhrase) text = scriptedEcho(snapshot.label) + text;
+    let text;
+    if (topicRound >= minRounds) text = strat.closingFallback || "Thanks for sharing your view. Let's leave this topic here.";
+    else {
+      // Keep scripted replies aligned with the same retry progression as the
+      // model prompt, regardless of how many topics this strategy has seen.
+      const fallbackRound = Math.min(topicRound - 1, bank.length - 1);
+      text = bank[Math.max(0, fallbackRound)];
+    }
     return { text, meta: { ...meta, engine_used: "scripted", latency_ms: Math.round(perf() - t0) } };
   }
 
@@ -721,42 +745,48 @@
     return out;
   }
 
-  // Words that count as reflecting each affect label back to the participant
-  const ECHO_WORDS = {
-    tense: /\b(tense|tension|stress|on edge|uneasy|anxious|nervous|wound up|uptight)/i,
-    irritated: /\b(irritat|bother|annoy|frustrat|fed up|worked up|agitated|upset)/i,
-    subdued: /\b(subdued|low|down|flat|quiet|deflated|tired|muted|unenthusiastic)/i,
-    upbeat: /\b(upbeat|energi|excited|enthusias|lively|animated|positive|cheerful|happy)/i,
-    warm: /\b(relaxed|easygoing|easy-going|warm|content|comfortable|at ease|laid[- ]back)/i,
-    calm: /\b(calm|relaxed|steady|composed|at ease|settled|laid[- ]back)/i,
-    alert: /\b(alert|focused|engaged|attentive|sharp|keen|switched on|tuned in)/i,
-  };
-  const OPENING_REFLECTION = /^(you (sound|seem|look|come across|appear)|it (sounds|seems|looks) like you)[^.!?]*[.!?]\s*/i;
-  function echoPresent(text, label) {
-    const re = ECHO_WORDS[label];
-    return !re || re.test(text);      // "neutral" (no pattern) never needs adding
-  }
-  function isExitLine(text) {
-    return /researcher will be with you/i.test(text);
-  }
-
-  function scriptedEcho(label) {
-    const map = {
-      tense: "You sound a little tense about this. ", irritated: "You seem pretty bothered by this. ",
-      subdued: "You seem a bit low on this one. ", upbeat: "You sound energized about this. ",
-      warm: "You seem relaxed and easygoing about it. ", calm: "You seem calm about this. ",
-      alert: "You seem quite alert to this. ", neutral: "",
-    };
-    return map[label] || "";
+  function emotionStyledCaption(text, emotion) {
+    const label = String(emotion || "neutral").toLowerCase().split(/[, +]/)[0].trim();
+    const aliases = { joy: "happiness", happy: "happiness", amused: "happiness", amusement: "happiness", frustrated: "anger", frustration: "anger", angry: "anger", annoyed: "anger", annoyance: "anger", disapproval: "anger", anxious: "fear", anxiety: "fear", nervousness: "fear", sad: "sadness", disappointment: "sadness", proud: "pride", admiration: "pride", interested: "interest", curious: "interest", curiosity: "interest" };
+    const mood = aliases[label] || label;
+    const base = String(text || "").trim();
+    const lowerFirst = (s) => s ? s[0].toLowerCase() + s.slice(1) : s;
+    const emphatic = (s) => s.replace(/[.!?]+\s*$/, "!");
+    if (mood === "happiness") return `${/^wow\b/i.test(base) ? emphatic(base) : `Wow, ${emphatic(lowerFirst(base))}`} 😄😄`;
+    if (mood === "interest") return `${/^(ooh|oh)\b/i.test(base) ? base : `Ooh, ${lowerFirst(base)}`} 🤔`;
+    if (mood === "pride") return `${/^nice\b/i.test(base) ? emphatic(base) : `Nice! ${lowerFirst(base)}`} ✨`;
+    if (mood === "anger") return `${/^oh\b/i.test(base) ? base : `Oh—${lowerFirst(base)}`} 😤`;
+    if (mood === "shame") return `${/^well\b/i.test(base) ? base : `Well… ${lowerFirst(base)}`} 😳`;
+    if (mood === "sadness") return `${base.replace(/[.!?]+\s*$/, "…")} 😔`;
+    if (mood === "fear") return `${/^oh\b/i.test(base) ? base : `Oh… ${lowerFirst(base)}`} 😟`;
+    if (mood === "disgust") return `${/^oof\b/i.test(base) ? base : `Oof… ${lowerFirst(base)}`} 😣`;
+    if (mood === "surprise") return `${/^whoa\b/i.test(base) ? emphatic(base) : `Whoa! ${lowerFirst(base)}`} 😮`;
+    return base;
   }
 
   function botSay(text, meta = {}) {
+    const strategyStimulus = ["anger", "pride"].includes(S.strategy)
+      && meta.kind === "reply" && meta.strategy_used === S.strategy && meta.line !== "standard_question";
+    if (!HOSTED) setListening(false);
+    setMicTurn(false);
+    setAiEmotion(S.condition === "other_mediated" ? S.feedbackEmotionLabel : "neutral", true);
+    if (S.condition === "other_mediated" && S.feedbackEmotionLabel !== "neutral") renderSubtitleTint(S.feedbackEmotionLabel);
+    else clearSubtitleTint();
+    const caption = S.condition === "other_mediated"
+      ? emotionStyledCaption(text, S.feedbackEmotionLabel)
+      : text;
     S.history.push({ role: "assistant", content: text });
-    S.transcript.push({ ...now(), ...phaseInfo(), speaker: "bot", text });
-    addMsg("bot", text);
-    $("subtitleText").textContent = text;
-    log("bot_message", { text, ...meta });
-    speak(text);
+    S.transcript.push({ ...now(), ...phaseInfo(), speaker: "bot", text, subtitle_text: caption });
+    addMsg("bot", caption);
+    $("subtitleText").textContent = caption;
+    log("bot_message", { text, subtitle_text: caption, subtitle_emotion: S.condition === "other_mediated" ? S.feedbackEmotionLabel : null, strategy_stimulus: strategyStimulus, ...meta });
+    speak(text, strategyStimulus);
+  }
+
+  function markStrategyStimulusDelivered(how) {
+    if (S.strategyStimulusDelivered || !["anger", "pride"].includes(S.strategy)) return;
+    S.strategyStimulusDelivered = true;
+    log("strategy_stimulus_delivered", { strategy: S.strategy, delivery: how, source: "completed_ai_reply" });
   }
 
   // ---------------- TTS ----------------
@@ -768,16 +798,20 @@
   }
   if (window.speechSynthesis) { pickVoice(); speechSynthesis.onvoiceschanged = pickVoice; }
 
-  function speak(text) {
+  function speak(text, strategyStimulus = false) {
     const tile = $("botTile");
     if (S.botSpeaking) stopSpeaking("replaced");
     S.currentBotText = text;
+    $("voiceOnlyHint").textContent = "Wait for Alex to finish speaking. Then press the microphone, answer aloud, and press it again when you finish.";
     const clean = text.replace(EMOJI_RE, "").trim();
-    if (S.tts && HOSTED && H.tts) { speakHosted(text, clean, tile); return; }
+    if (S.tts && HOSTED && H.tts) { speakHosted(text, clean, tile, strategyStimulus); return; }
     if (!S.tts || !window.speechSynthesis) {
       // Subtitles only: treat the reading time as Alex's turn
-      S.botEndAt = perf() + Math.min(8000, 800 + clean.length * 45);
-      tile.classList.add("talking"); setTimeout(() => tile.classList.remove("talking"), 1500);
+      const readingMs = Math.min(12000, 1000 + clean.length * 75);
+      S.botEndAt = perf() + readingMs;
+      S.botSpeaking = true;
+      tile.classList.add("talking");
+      setTimeout(() => { tile.classList.remove("talking"); S.botSpeaking = false; if (strategyStimulus) markStrategyStimulusDelivered("subtitle_reading_complete"); setAiEmotion("neutral", false); setMicTurn(true, true); }, readingMs);
       return;
     }
     speechSynthesis.cancel();
@@ -792,11 +826,14 @@
     const done = (how) => {
       if (id !== ttsId || !S.botSpeaking) return;          // stale callback
       S.botSpeaking = false;
+      if (strategyStimulus && ["completed", "timeout"].includes(how)) markStrategyStimulusDelivered(how);
       S.botEndAt = perf();
       S.echoGuardUntil = perf() + CV.echoGuardMs;
       tile.classList.remove("talking");
+      setAiEmotion("neutral", false);
       clearTimeout(ttsSafety);
       pauseRecog(false, "tts");
+      setMicTurn(true, ["completed", "timeout"].includes(how));
       log("tts_end", { how });
     };
     u.onstart = () => { if (id === ttsId) log("tts_start"); };
@@ -809,7 +846,7 @@
   }
 
   // Hosted demo: Alex speaks with Claude's voice through the `tts` capability
-  function speakHosted(text, clean, tile) {
+  function speakHosted(text, clean, tile, strategyStimulus = false) {
     const id = ++ttsId;
     S.ttsChar = 0;
     S.botSpeaking = true;
@@ -817,7 +854,9 @@
     const done = (how) => {
       if (id !== ttsId || !S.botSpeaking) return;
       S.botSpeaking = false; S.botEndAt = perf();
-      tile.classList.remove("talking"); clearTimeout(ttsSafety);
+      if (strategyStimulus && ["completed", "timeout"].includes(how)) markStrategyStimulusDelivered(how);
+      tile.classList.remove("talking"); setAiEmotion("neutral", false); clearTimeout(ttsSafety);
+      setMicTurn(true, how === "completed" || how === "timeout");
       log("tts_end", { how });
     };
     log("tts_start");
@@ -833,114 +872,134 @@
     if (HOSTED && H.tts) { try { H.tts.stop(); } catch (e) {} }
     window.speechSynthesis && speechSynthesis.cancel();
     S.botSpeaking = false;
+    // A barge-in or pause means the pending AI reply did not finish, so it is
+    // not a completed conversation round and cannot trigger a topic change.
+    S.pendingRoundCompletion = false;
     S.botEndAt = perf();
     S.echoGuardUntil = reason === "barge_in" ? 0 : perf() + CV.echoGuardMs;
     $("botTile").classList.remove("talking");
+    setAiEmotion("neutral", false);
+    setMicTurn(true);
     pauseRecog(false, "tts");
     log("tts_end", { how: reason, spoken_chars: S.ttsChar, text_chars: S.currentBotText.length });
   }
 
   // ---------------- STT ----------------
-  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-  let recog = null, recogWanted = false;
+  let recogWanted = false;
   const recogPauses = new Set();
   let utterBuf = "", interimBuf = "", utterTimer = null, committedInterim = "";
 
   function setListening(on) {
+    if (on) setAiEmotion("neutral", false);
     if (HOSTED) {                       // push-to-talk only: never listens on its own
       $("micBtn").classList.toggle("on", on && !!(H && H.dict));
       if (!on) stopDictation(false);
       return;
     }
-    recogWanted = on && !!SR;
+    recogWanted = !!on; localListening = !!on;
     $("micBtn").classList.toggle("on", recogWanted);
-    if (recogWanted) startRecog();
-    else if (recog) { try { recog.abort(); } catch (e) {} }
+    $("micBtn").title = recogWanted ? "Finish your spoken answer" : "Start your spoken answer";
+    $("micBtn").setAttribute("aria-label", recogWanted ? "Finish your spoken answer" : "Start your spoken answer");
+    $("voiceOnlyHint").textContent = recogWanted
+      ? `Listening. Please speak for at least ${C.affect.minFeedbackSeconds || 10} seconds before finishing. You can stop the session at any time.`
+      : "Alex will ask a question. Press the microphone to answer, then press it again when you finish.";
+    if (recogWanted) {
+      sampleQueue = []; sampleCount = 0; sampleQueueStartMs = null; windowParticipantAnswer = false;
+      participantAnswerSamples = 0; participantSpeechSamples = 0;
+      answerEmotionWindows = [];
+      faceCueHistory = [];
+      S.voiceActiveUntil = perf() + 3600e3;
+      $("liveTranscript").textContent = "";
+    } else {
+      S.voiceActiveUntil = 0;
+      $("micBtn").classList.remove("hearing");
+    }
   }
   function pauseRecog(on, reason) {
     if (on) recogPauses.add(reason); else recogPauses.delete(reason);
-    if (recogPauses.size && recog) { try { recog.abort(); } catch (e) {} }
-    if (!recogPauses.size && recogWanted) startRecog();
   }
-  function startRecog() {
-    if (HOSTED || !SR || recogPauses.size) return;
-    if (!recog) {
-      recog = new SR();
-      recog.lang = "en-US"; recog.continuous = true; recog.interimResults = true;
-      recog.onresult = onSpeechResult;
-      recog.onerror = (e) => { if (e.error !== "no-speech" && e.error !== "aborted") log("stt_error", { error: e.error }); };
-      recog.onend = () => { if (recogWanted && !recogPauses.size) setTimeout(startRecog, 250); };
+  function setMicTurn(canAnswer, completedBotTurn = false) {
+    const phaseAvailable = !S.chatLocked && !S.ended && curPhase()?.kind === "chat";
+    if (completedBotTurn && S.pendingRoundCompletion) {
+      S.pendingRoundCompletion = false;
+      S.turnsOnTopic++;
+      S.topicChangePending = S.turnsOnTopic >= Math.max(1, CV.minTurnsPerTopic || 4);
+      log("participant_ai_round_completed", { topic: S.topic, completed_rounds: S.turnsOnTopic, topic_change_pending: S.topicChangePending });
+      if (S.topicChangePending && phaseAvailable && !S.phaseEndPending) {
+        log("topic_advance_after_completed_rounds", { topic: S.topic, completed_rounds: S.turnsOnTopic });
+        newTopic(false);
+        return;
+      }
     }
-    try { recog.start(); } catch (e) { /* already running */ }
+    if (S.topicChangePending && S.phaseEndPending && S.phaseClosingMode === "allow_answer") {
+      // The phase-ending reply completed the required final round. Close this
+      // phase now; the next topic opens at the start of the next chat phase.
+      S.phaseClosingMode = "finish_turn";
+    }
+    const ready = canAnswer && phaseAvailable && !(S.topicChangePending && S.phaseEndPending);
+    $("micBtn").disabled = !ready;
+    $("voiceOnlyHint").textContent = ready
+      ? `Alex has finished. Answer aloud for at least ${C.affect.minFeedbackSeconds || 10} seconds, then press the microphone again. You can stop the session at any time.`
+      : "Alex is speaking. Please wait; the microphone will be ready when the question is finished.";
   }
-
   const words = (s) => s.toLowerCase().replace(/[^a-z0-9' ]/g, " ").split(/\s+/).filter(Boolean);
   const INTERRUPT_WORDS = new Set(["wait", "sorry", "hold", "actually", "stop", "excuse", "hang"]);
-  // Is this speech just the microphone picking up Alex's own voice?
   function isEcho(heard, botText) {
-    const hw = words(heard);
-    if (!hw.length) return true;
-    const bw = new Set(words(botText));
-    return hw.filter((w) => bw.has(w)).length / hw.length >= 0.6;
+    const hw = words(heard); if (!hw.length) return true;
+    const bw = new Set(words(botText)); return hw.filter(w => bw.has(w)).length / hw.length >= 0.6;
   }
-  function looksLikeParticipant(heard) {
-    const hw = words(heard);
-    return hw.length >= CV.bargeInMinWords || (hw.length === 1 && INTERRUPT_WORDS.has(hw[0]));
-  }
-
-  function onSpeechResult(e) {
-    if (S.chatLocked || S.activeProbe) return;              // check-in open: ignore speech
-    let interim = "", newFinal = "";
-    for (let i = e.resultIndex; i < e.results.length; i++) {
-      const r = e.results[i];
-      if (r.isFinal) newFinal += " " + r[0].transcript;
-      else interim += r[0].transcript;
-    }
-    // Drop a final that repeats an interim we already committed on a timeout
-    if (committedInterim && newFinal && words(newFinal).join(" ") === words(committedInterim).join(" ")) {
-      committedInterim = ""; newFinal = "";
-    }
-    const heard = (newFinal + " " + interim).trim();
-    if (!heard) return;
-
-    // While Alex is talking (or just stopped), filter out Alex's own voice.
-    if (S.botSpeaking || perf() < S.echoGuardUntil) {
+  function looksLikeParticipant(heard) { const w = words(heard); return w.length >= CV.bargeInMinWords || (w.length === 1 && INTERRUPT_WORDS.has(w[0])); }
+  function acceptLocalTranscript(text, fromAnswerWindow = false) {
+    const heard = (text || "").trim();
+    if (!heard || (!localListening && !fromAnswerWindow) || S.chatLocked || S.activeProbe) return;
+    if (!fromAnswerWindow && (S.botSpeaking || perf() < S.echoGuardUntil)) {
       if (isEcho(heard, S.currentBotText) || !looksLikeParticipant(heard)) return;
-      if (S.botSpeaking) {
-        // Participant is talking over Alex: Alex stops and listens.
-        log("bot_interrupted", { heard, spoken_chars: S.ttsChar, text_chars: S.currentBotText.length });
-        stopSpeaking("barge_in");
-      }
+      if (S.botSpeaking) { log("bot_interrupted", { heard, spoken_chars: S.ttsChar, text_chars: S.currentBotText.length }); stopSpeaking("barge_in"); }
       S.echoGuardUntil = 0;
     }
-
-    if (newFinal) utterBuf += newFinal;
-    interimBuf = interim;
-    $("liveTranscript").textContent = (utterBuf + " " + interim).trim();
-    $("micBtn").classList.add("hearing");
-    S.voiceActiveUntil = perf() + CV.endOfUtteranceMs;
-    clearTimeout(utterTimer);
-    utterTimer = setTimeout(commitUtterance, CV.endOfUtteranceMs);
+    speechBuffer = (speechBuffer + " " + heard).trim(); utterBuf = speechBuffer;
+    $("liveTranscript").textContent = speechBuffer; $("micBtn").classList.add("hearing");
+    if (localListening) S.voiceActiveUntil = perf() + 3600e3;
+    else if (fromAnswerWindow && inflightEmotionWindows > 0) S.voiceActiveUntil = perf() + 3600e3;
+    else {
+      S.voiceActiveUntil = perf() + CV.endOfUtteranceMs;
+      clearTimeout(speechTimer); speechTimer = setTimeout(commitLocalSpeech, CV.endOfUtteranceMs);
+    }
+  }
+  function commitLocalSpeech() {
+    clearTimeout(speechTimer); speechTimer = null;
+    const t = speechBuffer.trim(); speechBuffer = ""; utterBuf = ""; interimBuf = "";
+    $("liveTranscript").textContent = ""; $("micBtn").classList.remove("hearing"); S.voiceActiveUntil = 0;
+    if (t) handleUser(t, "voice");
+  }
+  function finishLocalAnswer() {
+    const feedbackEligible = participantSpeechSamples >= MIN_EMOTION_FEEDBACK_SAMPLES;
+    if (!feedbackEligible) {
+      const remaining = Math.max(1, Math.ceil((MIN_EMOTION_FEEDBACK_SAMPLES - participantSpeechSamples) / 16000));
+      toast(`Please continue speaking for at least ${remaining} more second${remaining === 1 ? "" : "s"}.`);
+      $("voiceOnlyHint").textContent = `Please keep speaking for at least ${remaining} more second${remaining === 1 ? "" : "s"}. The Stop button remains available if you want to end the session.`;
+      log("minimum_speech_prompt", { spoken_ms: Math.round(participantSpeechSamples / 16), minimum_ms: Math.round(MIN_EMOTION_FEEDBACK_SAMPLES / 16) });
+      return false;
+    }
+    setListening(false);
+    if (!submitBusy && sampleCount >= 16000) sendEmotionWindow(true);
+    else if (!submitBusy && inflightEmotionWindows === 0) {
+      if (speechBuffer.trim()) commitLocalSpeech();
+      else toast("Please speak for at least a second, then press the microphone to finish.");
+    }
+    return true;
   }
 
-  // The participant has been quiet for endOfUtteranceMs: send what they said
   function commitUtterance() {
-    clearTimeout(utterTimer);
-    $("micBtn").classList.remove("hearing");
-    let t = utterBuf.trim();
-    if (interimBuf.trim()) { t = (t + " " + interimBuf).trim(); committedInterim = interimBuf; }
-    utterBuf = ""; interimBuf = "";
-    $("liveTranscript").textContent = "";
-    S.voiceActiveUntil = 0;
-    if (t) handleUser(t, "voice");
+    commitLocalSpeech();
   }
 
   // Phase ending / check-in opening mid-sentence: keep the words, no reply
   function flushUtterance(reason) {
-    clearTimeout(utterTimer);
+    clearTimeout(utterTimer); clearTimeout(speechTimer);
     $("micBtn").classList.remove("hearing");
-    const t = (utterBuf + " " + interimBuf).trim();
-    if (interimBuf.trim()) committedInterim = interimBuf;
+    const t = speechBuffer.trim();
+    speechBuffer = "";
     utterBuf = ""; interimBuf = "";
     $("liveTranscript").textContent = "";
     S.voiceActiveUntil = 0;
@@ -984,7 +1043,7 @@
   $("micBtn").onclick = () => {
     if (S.chatLocked || S.inputMode !== "voice") return;
     if (HOSTED) {
-      if (!H || !H.dict) { toast("Speech input isn't available here. Type your answer instead."); return; }
+      if (!H || !H.dict) { toast("Spoken input is unavailable. The session cannot continue without it."); return; }
       if (H.dict.active()) { log("mic_toggle", { on: false }); H.dict.stop().catch(() => {}); return; }
       if (S.botSpeaking) {             // pressing the mic while Alex talks: Alex stops and listens
         log("bot_interrupted", { heard: "(pressed the microphone)", spoken_chars: S.ttsChar, text_chars: S.currentBotText.length });
@@ -992,24 +1051,18 @@
       }
       dictDiscard = false;
       H.dict.start().catch((e) => {
-        if (e && e.code === "not_granted") toast("Microphone access was declined. You can type your answers instead.");
+        if (e && e.code === "not_granted") toast("Microphone access was declined. Allow it in the browser before continuing.");
       });
       log("mic_toggle", { on: true });
       return;
     }
-    setListening(!recogWanted); log("mic_toggle", { on: recogWanted });
+    if (!recogWanted && S.botSpeaking) stopSpeaking("barge_in");
+    if (recogWanted) {
+      if (!finishLocalAnswer()) return;
+    }
+    else { if (S.botSpeaking) stopSpeaking("barge_in"); setListening(true); }
+    log("mic_toggle", { on: recogWanted });
   };
-  $("sendBtn").onclick = () => {
-    if (S.chatLocked) return;
-    const v = $("textInput").value; $("textInput").value = "";
-    S.typingUntil = 0;
-    handleUser(v, "text");
-  };
-  $("textInput").addEventListener("keydown", (e) => { if (e.key === "Enter") $("sendBtn").click(); });
-  $("textInput").addEventListener("input", () => {
-    S.typingUntil = $("textInput").value.trim() ? perf() + CV.typingHoldMs : 0;   // Alex waits while they type
-  });
-
   function addMsg(who, text) {
     const d = document.createElement("div");
     d.className = "msg " + who; d.textContent = text;
@@ -1023,7 +1076,7 @@
     if (S.activeProbe) s = "Paused";
     else if (S.botSpeaking) s = "Speaking";
     else if (userActive()) s = "Listening…";
-    else if (S.busy || S.openingTopic) s = "Thinking…";
+    else if (S.busy) s = "Thinking…";
     if (s !== lastStatus) {
       $("botStatus").textContent = s;
       $("botStatus").classList.toggle("on", !!s);
@@ -1042,22 +1095,42 @@
     if (S.nextProbeAt == null || S.phaseElapsed < S.nextProbeAt) return;
     if (left < C.probes.minRemainingSec || inNoticeWindow()) {
       log("probe_skipped", { reason: "phase_ending" });
-      S.nextProbeAt = null; S.probeDueAt = null;
+      S.nextProbeAt = null; S.probeDueAt = null; S.probeDeferredReason = null;
       return;
     }
     if (S.probeDueAt == null) S.probeDueAt = perf();
     const waited = perf() - S.probeDueAt;
-    // Wait for a natural gap (Alex done speaking, participant done talking), up to maxDeferSec
-    if ((!S.botSpeaking && !userActive()) || waited > C.probes.maxDeferSec * 1000) showProbe("scheduled", waited);
+    const blockedBy = probeBlockedBy();
+    if (blockedBy) {
+      if (S.probeDeferredReason !== blockedBy) {
+        log("probe_deferred", { reason: blockedBy, deferred_ms: Math.round(waited) });
+        S.probeDeferredReason = blockedBy;
+      }
+      return;
+    }
+    showProbe("scheduled", waited);
+  }
+
+  function probeBlockedBy() {
+    if (S.botSpeaking) return "ai_speaking";
+    const hostedDictActive = HOSTED && !!(H && H.dict && H.dict.active());
+    const micCapturing = localListening || recogWanted || hostedDictActive || userActive() ||
+      $("micBtn").classList.contains("hearing") || $("micBtn").classList.contains("dictating");
+    if (micCapturing) return "participant_answer_in_progress";
+    if (S.busy || submitBusy || inflightEmotionWindows > 0) return "turn_processing";
+    if (speechBuffer.trim() || utterBuf.trim() || interimBuf.trim()) return "uncommitted_speech";
+    return null;
   }
 
   function setChatLocked(on) {
     S.chatLocked = on;
     $("chatPanel").classList.toggle("locked", on);
-    $("textInput").disabled = on; $("sendBtn").disabled = on; $("micBtn").disabled = on;
-    $("textInput").placeholder = on ? "Chat paused during the check-in" : "Type or speak your answer…";
+    $("micBtn").disabled = on;
+    $("voiceOnlyHint").textContent = on
+      ? "Conversation paused while you answer the check-in."
+      : "Speak your answer. Use the microphone button to pause or resume listening.";
     $("chatbox").inert = on;
-    if (on) { S.typingUntil = 0; S.voiceActiveUntil = 0; pauseRecog(true, "checkin"); stopDictation(true); }
+    if (on) { S.voiceActiveUntil = 0; pauseRecog(true, "checkin"); stopDictation(true); }
     else pauseRecog(false, "checkin");
   }
 
@@ -1072,14 +1145,24 @@
 
   function showProbe(trigger, deferredMs = 0) {
     const p = curPhase();
-    if (S.activeProbe || !p || p.kind !== "chat") return;
-    if (S.botSpeaking) stopSpeaking("checkin");
-    flushUtterance("checkin");
+    if (S.activeProbe || !p || p.kind !== "chat") return false;
+    const blockedBy = probeBlockedBy();
+    if (blockedBy) {
+      S.probeDueAt = S.probeDueAt ?? perf();
+      S.probeDeferredReason = blockedBy;
+      if (trigger === "manual") {
+        S.nextProbeAt = S.phaseElapsed;
+        toast("Check-in will wait until you finish speaking and Alex finishes replying.");
+      }
+      log("probe_deferred", { reason: blockedBy, trigger, deferred_ms: Math.round(perf() - S.probeDueAt) });
+      return false;
+    }
     setChatLocked(true);
     S.probeCount++;
     S.probeDueAt = null;
+    S.probeDeferredReason = null;
     const id = `probe_${S.probeCount}`;
-    const shown = log("probe_shown", { probe_id: id, trigger, deferred_ms: Math.round(deferredMs), affect: engine.snapshot() });
+    const shown = log("probe_shown", { probe_id: id, trigger, deferred_ms: Math.round(deferredMs), affect: getAffectSnapshot() });
 
     const layer = $("probeLayer");
     layer.innerHTML = "";
@@ -1148,7 +1231,7 @@
         ...Object.fromEntries(C.probeItems.map((it) => [it.id, answers[it.id]])),
         ...Object.fromEntries(C.probeItems.map((it) => [`${it.id}_first_rt_ms`, firstRt[it.id]])),
         ...Object.fromEntries(C.probeItems.map((it) => [`${it.id}_n_changes`, nChanges[it.id]])),
-        affect_at_shown: shown.affect, affect_at_answer: engine.snapshot(),
+        affect_at_shown: shown.affect, affect_at_answer: getAffectSnapshot(),
       };
       S.probes.push(rec);
       log("probe_response", rec);
@@ -1164,6 +1247,7 @@
     refresh();
     S.activeProbe = { id, card, shownPerf: perf(), shown, submitted: false };
     $("probeTitle").focus();
+    return true;
   }
 
   function closeProbe() {
@@ -1173,7 +1257,6 @@
     setChatLocked(false);
     S.lastUserAt = perf();                                     // restart the silence timer
     scheduleNextProbe();
-    if (S.inputMode === "text" && !S.ended) $("textInput").focus();
   }
   function clearProbe(reason) {
     if (!S.activeProbe) return;
@@ -1188,6 +1271,8 @@
   }
   function scheduleNextProbe() {
     const p = curPhase();
+    S.probeDeferredReason = null;
+    S.probeDueAt = null;
     S.nextProbeAt = p && p.kind === "chat" && (p.isCondition || !C.probes.onlyDuringCondition) ? S.phaseElapsed + randProbeDelay() : null;
   }
 
@@ -1198,70 +1283,312 @@
     $("directPanel").classList.toggle("hidden", S.condition !== "direct");
   }
 
-  function startSampling() {
-    setInterval(() => {
-      if (S.ended || !engine) return;
-      const f = engine.update();
-      const snap = engine.snapshot();
-      log("affect_sample", snap);
-      if (engine.external.connected) {
-        const payload = { type: "features", ...now(), features: snap };
-        if (C.affect.sendFramesToExternal) payload.frame_jpeg_b64 = grabFrame();
-        engine.sendToExternal(payload);
-      }
-      $("xAffect").textContent = `${f.label}, valence ${f.valence.toFixed(2)}, arousal ${f.arousal.toFixed(2)}`;
-      $("xSource").textContent = f.source + (engine.external.connected ? " (ext model live)" : "");
-
-      const p = curPhase();
-      if (!p || p.kind !== "chat") return;
-      if (S.condition === "other_mediated") renderSubtitleTint(f);
-      else if (S.condition === "direct") renderDirect(f);
-      if ((S.condition !== "none") && f.label !== S.lastFeedbackLabel) {
-        log("feedback_render", { feedback_label: f.label, valence: snap.valence, arousal: snap.arousal });
-        S.lastFeedbackLabel = f.label;
-      }
-    }, C.affect.sampleMs);
+  async function localEmotionReady() {
+    try { const r = await fetch("/api/emotion/health"); const d = await r.json(); return r.ok && d.status === "ready" && d.models && d.models.joint === "lightmer_stage2"; }
+    catch (_) { return false; }
   }
+  function setFaceLocatorStatus(state, message) {
+    const tile = $("selfTile"), status = $("faceStatus"), box = $("faceBox");
+    if (tile) tile.dataset.faceState = state;
+    if (status && status.textContent !== message) status.textContent = message;
+    if (box && state !== "found") box.style.display = "none";
+  }
+  function renderFaceLocator() {
+    const video = $("selfVideo"), boxEl = $("faceBox");
+    if (!video || !boxEl) return;
+    const face = faceCueEngine && faceCueEngine.face;
+    if (!faceCueEngine || !faceCueEngine.faceReady) {
+      setFaceLocatorStatus(HOSTED ? "unavailable" : "waiting", HOSTED ? "Face locator unavailable" : "Face detector starting…");
+      return;
+    }
+    if (!face || !face.box || face.conf < 0.2 || perf() - face.t > 1200) {
+      const message = !video.videoWidth ? "Waiting for camera…" : face && face.t ? "No face detected · move into view" : "Looking for your face…";
+      setFaceLocatorStatus("missing", message);
+      return;
+    }
+    const rect = video.getBoundingClientRect();
+    const frameWidth = face.box.frameWidth || video.videoWidth;
+    const frameHeight = face.box.frameHeight || video.videoHeight;
+    if (!rect.width || !rect.height || !frameWidth || !frameHeight) {
+      setFaceLocatorStatus("missing", "Waiting for camera…");
+      return;
+    }
+    // Match object-fit: cover and the mirrored self-view, so this box is drawn
+    // around the face exactly where the participant sees it.
+    const scale = Math.max(rect.width / frameWidth, rect.height / frameHeight);
+    const cropX = (frameWidth * scale - rect.width) / 2;
+    const cropY = (frameHeight * scale - rect.height) / 2;
+    const width = face.box.width * scale;
+    const height = face.box.height * scale;
+    const left = rect.width - ((face.box.x + face.box.width) * scale - cropX);
+    const top = face.box.y * scale - cropY;
+    boxEl.style.left = `${left}px`;
+    boxEl.style.top = `${top}px`;
+    boxEl.style.width = `${width}px`;
+    boxEl.style.height = `${height}px`;
+    boxEl.style.display = "block";
+    setFaceLocatorStatus("found", `Face detected · ${Math.round(face.conf * 100)}%`);
+  }
+  async function startClientFaceCueDetector() {
+    if (HOSTED) { setFaceLocatorStatus("unavailable", "Face locator unavailable in this mode"); return false; }
+    if (!S.stream || !window.AffectEngine) { setFaceLocatorStatus("unavailable", "Face detector unavailable"); return false; }
+    setFaceLocatorStatus("waiting", "Loading face detector…");
+    if (faceCueEngine) faceCueEngine.stopFace();
+    faceCueEngine = new window.AffectEngine(C.affect, () => {});
+    const ready = await faceCueEngine.initFace($("selfVideo"), "vendor/models");
+    if (!ready) {
+      log("local_face_expression_unavailable", { reason: "local model load failed" });
+      setFaceLocatorStatus("unavailable", "Face detector unavailable");
+      return false;
+    }
+    if (faceCueSampler) clearInterval(faceCueSampler);
+    faceCueSampler = setInterval(() => {
+      renderFaceLocator();
+      if (!localListening) return;
+      const face = faceCueEngine && faceCueEngine.face;
+      if (!face || !face.conf || !face.expressions) return;
+      faceCueHistory.push({ at: perf(), expressions: { ...face.expressions } });
+      const cutoff = perf() - 18000;
+      while (faceCueHistory.length && faceCueHistory[0].at < cutoff) faceCueHistory.shift();
+    }, 250);
+    renderFaceLocator();
+    log("local_face_expression_ready", { model: "face-api.js local expression net", detector_threshold: 0.2 });
+    return true;
+  }
+  function stopClientFaceCueDetector() {
+    if (faceCueSampler) clearInterval(faceCueSampler);
+    faceCueSampler = null;
+    if (faceCueEngine) faceCueEngine.stopFace();
+    faceCueEngine = null;
+    faceCueHistory = [];
+    setFaceLocatorStatus("waiting", "Face detection stopped");
+  }
+  const FACE_LABELS = { happy: "happiness", sad: "sadness", angry: "anger", fearful: "fear", disgusted: "disgust", surprised: "surprise", neutral: "neutral" };
+  const TEXT_EMOTION_TERMS = {
+    anger: ["angry", "anger", "furious", "rage", "frustrated", "frustrating", "frustration", "annoyed", "annoying", "irritated", "irritating", "resentful", "mad"],
+    disgust: ["disgusted", "disgusting", "grossed out", "repulsed", "revolting", "repelled", "contemptuous"],
+    fear: ["stressed", "stress", "stressful", "under pressure", "pressured", "overwhelmed", "anxious", "anxiety", "worried", "worry", "nervous", "uneasy", "panicked", "tense", "afraid", "scared", "insecure"],
+    happiness: ["happy", "happiness", "excited", "exciting", "joyful", "glad", "delighted", "pleased", "enjoyed", "enjoying", "cheerful", "thrilled", "amused", "relieved", "grateful", "content"],
+    sadness: ["sad", "sadness", "down", "disappointed", "disappointing", "lonely", "upset", "unhappy", "discouraged", "grief", "grieving", "heartbroken", "hopeless", "hurt"],
+    surprise: ["surprised", "shocked", "astonished", "unexpected", "amazed"],
+    shame: ["ashamed", "shame", "embarrassed", "embarrassment", "self conscious", "guilty", "guilt"],
+    pride: ["proud", "pride", "accomplished"],
+    interest: ["interested", "interest", "curious", "curiosity", "intrigued", "fascinated", "engaged"]
+  };
+  function transcriptEmotionCue(transcript) {
+    const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const terms = Object.values(TEXT_EMOTION_TERMS).flat().map(escape).sort((a, b) => b.length - a.length);
+    const termsPattern = terms.join("|");
+    const negative = new RegExp(`\\b(?:not|never|no longer|isn't|wasn't|aren't|don't|do not|didn't|doesn't)(?:\\s+\\w+){0,3}\\s+(?:${termsPattern})\\b`, "gi");
+    const text = String(transcript || "").toLowerCase().replace(negative, " ");
+    const mentions = [];
+    for (const [label, phrases] of Object.entries(TEXT_EMOTION_TERMS)) {
+      const pattern = new RegExp(`\\b(?:${phrases.map(escape).sort((a, b) => b.length - a.length).join("|")})\\b`, "g");
+      for (const match of text.matchAll(pattern)) mentions.push({ label, phrase: match[0], at: match.index });
+    }
+    if (!mentions.length) return null;
+    mentions.sort((a, b) => a.at - b.at);
+    const counts = new Map();
+    for (const mention of mentions) counts.set(mention.label, (counts.get(mention.label) || 0) + 1);
+    const winner = [...counts].sort((a, b) => b[1] - a[1] || mentions.filter((item) => item.label === b[0]).at(-1).at - mentions.filter((item) => item.label === a[0]).at(-1).at)[0][0];
+    const latest = [...mentions].reverse().find((mention) => mention.label === winner);
+    return { label: winner, phrase: latest.phrase, mentions: mentions.length };
+  }
+  function normalizedEmotionScores(scores, canonical) {
+    const mapped = {};
+    for (const [raw, value] of Object.entries(scores || {})) {
+      const label = canonical(raw);
+      if (Number.isFinite(+value) && +value >= 0) mapped[label] = (mapped[label] || 0) + +value;
+    }
+    const total = Object.values(mapped).reduce((sum, value) => sum + value, 0);
+    if (!total) return {};
+    for (const key of Object.keys(mapped)) mapped[key] /= total;
+    return mapped;
+  }
+  function faceCueForWindow(f) {
+    const start = Number(f.client_start_ms), end = Number(f.client_end_ms);
+    if (!Number.isFinite(start) || !Number.isFinite(end)) return { means: {}, cue: null, count: 0 };
+    const samples = faceCueHistory.filter((row) => row.at >= start - 350 && row.at <= end + 350);
+    const means = {};
+    if (samples.length) {
+      for (const key of Object.keys(FACE_LABELS)) {
+        means[key] = samples.reduce((sum, row) => sum + (+row.expressions[key] || 0), 0) / samples.length;
+      }
+    }
+    const ranked = Object.entries(means).filter(([key]) => key !== "neutral").sort((a, b) => b[1] - a[1]);
+    const [raw, mean] = ranked[0] || [];
+    const peak = raw ? Math.max(...samples.map((row) => +row.expressions[raw] || 0)) : 0;
+    const meanThreshold = C.affect.faceCueMeanThreshold || 0.035;
+    const peakThreshold = C.affect.faceCuePeakThreshold || 0.12;
+    const cue = samples.length >= 3 && raw && mean >= meanThreshold && peak >= peakThreshold
+      ? { label: FACE_LABELS[raw], mean: +mean.toFixed(4), peak: +peak.toFixed(4), samples: samples.length }
+      : null;
+    return { means, cue, count: samples.length };
+  }
+  function getAffectSnapshot() {
+    const f = latestEmotion || {};
+    return { label: f.label || "uncertain", emotion_terms: f.emotion_terms || [], status: f.status || "waiting", transcript: f.transcript || "", asr_ms: f.asr_ms || null, inference_ms: f.inference_ms || null, window_start_ms: f.client_start_ms ?? null, window_end_ms: f.client_end_ms ?? null };
+  }
+  function startLocalEmotionCapture() {
+    sampleQueue=[]; sampleCount=0;
+    emotionCtx=new (window.AudioContext||window.webkitAudioContext)(); audioSource=emotionCtx.createMediaStreamSource(S.stream);
+    emotionCtx.resume().catch(()=>{});
+    emotionProcessor=emotionCtx.createScriptProcessor(4096,1,1); const sink=emotionCtx.createGain(); sink.gain.value=0;
+    audioSource.connect(emotionProcessor); emotionProcessor.connect(sink); sink.connect(emotionCtx.destination);
+    emotionProcessor.onaudioprocess=(e)=>{
+      if(!emotionToken||S.ended||!localListening)return;const src=e.inputBuffer.getChannelData(0),ratio=emotionCtx.sampleRate/16000,out=new Float32Array(Math.floor(src.length/ratio));
+      for(let i=0;i<out.length;i++){const a=Math.floor(i*ratio),b=Math.min(src.length,Math.floor((i+1)*ratio));let sum=0;for(let j=a;j<b;j++)sum+=src[j];out[i]=sum/Math.max(1,b-a);}
+      if(sampleCount===0)sampleQueueStartMs=performance.now()-out.length/16;
+      windowParticipantAnswer=true;participantAnswerSamples+=out.length;let power=0;for(let i=0;i<src.length;i++)power+=src[i]*src[i];const rms=Math.sqrt(power/Math.max(1,src.length));if(rms>.008){participantSpeechSamples+=out.length;$("micBtn").classList.add("hearing");const seconds=Math.floor(participantSpeechSamples/16000);$("voiceOnlyHint").textContent=`Listening · ${seconds}/${C.affect.minFeedbackSeconds||10} seconds spoken. Keep going until you reach ${C.affect.minFeedbackSeconds||10} seconds.`;}
+      sampleQueue.push(out);sampleCount+=out.length;if(sampleCount>=80000)sendEmotionWindow(false);
+    };
+    frameTimer=setInterval(captureFrame,800);captureFrame();
+  }
+  const emotionFrames=[];
+  function captureFrame(){if(!emotionToken||!$("selfVideo").videoWidth)return;try{frameCanvas.getContext("2d").drawImage($("selfVideo"),0,0,224,168);emotionFrames.push({client_ms:performance.now(),jpeg:frameCanvas.toDataURL("image/jpeg",.7).split(",")[1]});while(emotionFrames.length>40)emotionFrames.shift();}catch(_){}}
+  function floatBase64(a){const bytes=new Uint8Array(a.length*4),v=new DataView(bytes.buffer);for(let i=0;i<a.length;i++)v.setFloat32(i*4,a[i],true);let b="";for(let i=0;i<bytes.length;i+=32768)b+=String.fromCharCode(...bytes.subarray(i,Math.min(i+32768,bytes.length)));return btoa(b);}
+  async function sendEmotionWindow(force=false){
+    if(submitBusy||!emotionToken||sampleCount<(force?16000:80000))return;submitBusy=true;inflightEmotionWindows++;
+    const take=Math.min(sampleCount,96000),parts=sampleQueue,samples=new Float32Array(take);let copied=0,used=0;
+    for(const part of parts){if(copied>=take)break;const n=Math.min(part.length,take-copied);samples.set(part.subarray(0,n),copied);copied+=n;used++;if(n<part.length){sampleQueue=[part.subarray(n),...parts.slice(used)];used=0;break;}}
+    if(used>0)sampleQueue=parts.slice(used);
+    sampleCount-=take;const startMs=sampleQueueStartMs??(performance.now()-take/16),endMs=startMs+take/16;sampleQueueStartMs=sampleCount?endMs:null;
+    const fromAnswer=windowParticipantAnswer,frames=emotionFrames.filter(f=>f.client_ms>=startMs-100&&f.client_ms<=endMs+100).slice(-8);
+    if(!sampleCount)windowParticipantAnswer=false;
+    try{const r=await fetch("/api/emotion/window",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({session_token:emotionToken,audio:floatBase64(samples),client_start_ms:startMs,client_end_ms:endMs,frames})});const ack=await r.json();if(!r.ok)throw new Error(ack.error||`HTTP ${r.status}`);
+      const until=Date.now()+25000;while(Date.now()<until&&emotionToken){await sleep(350);const sr=await fetch("/api/emotion/state",{headers:{"x-session-token":emotionToken}});const sd=await sr.json(),f=sd.fusion;if(f&&Math.abs((f.client_end_ms||0)-endMs)<100){const feedbackEligible=fromAnswer&&participantSpeechSamples>=MIN_EMOTION_FEEDBACK_SAMPLES;const shown=feedbackEligible?f:{...f,label:"uncertain",candidate:"uncertain",feedback_label:"uncertain",emotion_terms:[],scores:{},channel_scores:{},status:"insufficient_signal",demo_status:"answer_too_short"};applyEmotionResult(shown,fromAnswer,feedbackEligible);break;}}
+    }catch(e){log("emotion_window_error",{error:String(e.message||e)});}finally{
+      submitBusy=false;inflightEmotionWindows--;
+      if(sampleCount>=80000||(!localListening&&sampleCount>=16000))sendEmotionWindow(!localListening);
+      else if(!localListening&&inflightEmotionWindows===0)commitLocalSpeech();
+    }
+  }
+  function applyEmotionResult(f,fromAnswerWindow=false,feedbackEligible=true){
+    latestEmotion=f;
+    const faceWindow = fromAnswerWindow ? faceCueForWindow(f) : { means: {}, cue: null, count: 0 };
+    const textCue = fromAnswerWindow ? transcriptEmotionCue(f.transcript) : null;
+    let terms=Array.isArray(f.emotion_terms)?f.emotion_terms.slice():[];
+    const noEmotion = new Set(["uncertain", "neutral", "insufficient_signal", "no_face", "multiple_faces", "waiting"]);
+    const aliases = { happy: "happiness", joy: "happiness", amused: "happiness", amusement: "happiness", cheerful: "happiness", thrilled: "happiness", delighted: "happiness", angry: "anger", furious: "anger", rage: "anger", frustrated: "anger", frustrating: "anger", frustration: "anger", annoyed: "anger", annoyance: "anger", irritated: "anger", resentful: "anger", disapproval: "anger", sad: "sadness", disappointed: "sadness", disappointment: "sadness", grieving: "sadness", grief: "sadness", heartbroken: "sadness", hopeless: "sadness", anxious: "fear", anxiety: "fear", nervousness: "fear", nervous: "fear", fearful: "fear", stressed: "fear", stressful: "fear", stress: "fear", pressured: "fear", overwhelmed: "fear", worried: "fear", worry: "fear", panicked: "fear", tense: "fear", uneasy: "fear", afraid: "fear", scared: "fear", insecure: "fear", disgusted: "disgust", contemptuous: "disgust", surprised: "surprise", amazed: "surprise", embarrassed: "shame", embarrassment: "shame", ashamed: "shame", guilty: "shame", guilt: "shame", curious: "interest", curiosity: "interest", interested: "interest", fascinated: "interest", engaged: "interest", admired: "pride", admiration: "pride", proud: "pride", accomplished: "pride", relieved: "happiness", grateful: "happiness", content: "happiness" };
+    const canonical = (value) => {
+      const term = String(value || "").toLowerCase().split(/[, +]/)[0].trim();
+      return aliases[term] || term;
+    };
+    let mainEmotion=[f.feedback_label,terms[0],f.candidate,f.label]
+      .map(canonical).find((candidate)=>candidate&&!noEmotion.has(candidate))||"";
+
+    // Pool the short model windows from this spoken answer. This reduces
+    // frame-to-frame label flips while retaining the most salient non-neutral
+    // cue when neutral is only marginally ahead.
+    let pooledScores = {}, fusedScores = {}, feedbackScores = {};
+    let recentFaceCue = null;
+    let appliedTextCue = textCue;
+    let rawEmotionLabel = mainEmotion;
+    let strategyTarget = ({ anger: "anger", pride: "pride" })[S.strategy] || null;
+    let targetPriorApplied = 0;
+    let targetPriorEligible = false;
+    const hasFaceScores = Object.keys(faceWindow.means).length > 0;
+    const mergedChannelScores = { ...(f.channel_scores || {}) };
+    if (hasFaceScores) mergedChannelScores.face_api = faceWindow.means;
+    if (textCue) mergedChannelScores.explicit_text = { [textCue.label]: 1 };
+    if (fromAnswerWindow && feedbackEligible && ((f.scores && Object.keys(f.scores).length) || hasFaceScores || textCue || terms.length)) {
+      answerEmotionWindows.push({ scores: f.scores || {}, face_scores: faceWindow.means, face_cue: faceWindow.cue, text_cue: textCue, face_count: faceWindow.count, label: textCue?.label || mainEmotion || canonical(terms[0]), terms, sources: [...(f.sources || []), ...(faceWindow.cue ? ["face_api"] : []), ...(textCue ? ["explicit_text"] : [])], channel_scores: mergedChannelScores });
+      answerEmotionWindows = answerEmotionWindows.slice(-4);
+      const rows = answerEmotionWindows;
+      const totalWeight = rows.reduce((sum, _, i) => sum + i + 1, 0);
+      const pooledFaceScores = {};
+      for (const [i, row] of rows.entries()) {
+        const weight = (i + 1) / totalWeight;
+        for (const [key, value] of Object.entries(row.scores || {})) {
+          const normalized = canonical(key);
+          if (Number.isFinite(+value)) pooledScores[normalized] = (pooledScores[normalized] || 0) + weight * +value;
+        }
+        for (const [key, value] of Object.entries(row.face_scores || {})) {
+          const normalized = canonical(key);
+          if (Number.isFinite(+value)) pooledFaceScores[normalized] = (pooledFaceScores[normalized] || 0) + weight * +value;
+        }
+      }
+      const modelNorm = normalizedEmotionScores(pooledScores, canonical);
+      const faceNorm = normalizedEmotionScores(pooledFaceScores, canonical);
+      const recentTextCue = [...rows].reverse().find((row) => row.text_cue)?.text_cue || null;
+      appliedTextCue = recentTextCue;
+      const recentFaceCueRow = [...rows].reverse().find((row) => row.face_cue) || null;
+      recentFaceCue = recentFaceCueRow?.face_cue || null;
+      const cueWeights = C.affect.answerCueWeights || {};
+      const weights = recentTextCue
+        ? { model: cueWeights.model ?? 0.40, face: cueWeights.face ?? 0.15, text: cueWeights.explicitText ?? 0.45 }
+        : { model: cueWeights.modelWithoutText ?? 0.72, face: cueWeights.faceWithoutText ?? 0.28, text: 0 };
+      const labels = new Set([...Object.keys(modelNorm), ...Object.keys(faceNorm), ...rows.flatMap((row) => (row.terms || []).map(canonical)), ...(recentTextCue ? [recentTextCue.label] : []), "anger", "disgust", "fear", "happiness", "neutral", "sadness", "surprise"]);
+      for (const key of labels) fusedScores[key] = weights.model * (modelNorm[key] || 0) + weights.face * (faceNorm[key] || 0) + (recentTextCue?.label === key ? weights.text : 0);
+      const ranked = Object.entries(fusedScores).filter(([key, value]) => !noEmotion.has(key) && Number.isFinite(value)).sort((a, b) => b[1] - a[1]);
+      const bestNonNeutral = ranked.find(([key, value]) => key !== "neutral" && value > 0);
+      const specialLabels = rows.map((row) => canonical(row.label)).filter((key) => ["shame", "pride", "interest"].includes(key));
+      const special = specialLabels.length ? specialLabels[specialLabels.length - 1] : "";
+      rawEmotionLabel = recentTextCue?.label || special || bestNonNeutral?.[0] || ranked.find(([, value]) => value > 0)?.[0] || canonical(terms[0]) || mainEmotion;
+      if (noEmotion.has(rawEmotionLabel)) rawEmotionLabel = "";
+      // Keep measured affect independent from the active induction condition.
+      feedbackScores = { ...fusedScores };
+      const hasAffectEvidence = !!recentTextCue || !!recentFaceCue || terms.some((term) => !noEmotion.has(canonical(term))) || (bestNonNeutral?.[1] >= 0.03) || (!!mainEmotion && !noEmotion.has(mainEmotion));
+      targetPriorEligible = !!strategyTarget && S.strategyStimulusDelivered;
+      if (!recentTextCue && targetPriorEligible && hasAffectEvidence) {
+        targetPriorApplied = Math.max(0, Number(C.affect.strategyTargetPriorBoost) || 0);
+        feedbackScores[strategyTarget] = (feedbackScores[strategyTarget] || 0) + targetPriorApplied;
+      }
+      const feedbackRanked = Object.entries(feedbackScores).filter(([key, value]) => !noEmotion.has(key) && Number.isFinite(value)).sort((a, b) => b[1] - a[1]);
+      const feedbackNonNeutral = feedbackRanked.find(([key, value]) => key !== "neutral" && value > 0);
+      // Explicit emotion words stay in front. Otherwise, after Alex has
+      // delivered the induction stimulus, its target can shape the next cue.
+      mainEmotion = recentTextCue?.label || (targetPriorApplied ? feedbackNonNeutral?.[0] : rawEmotionLabel) || rawEmotionLabel;
+    }
+    const nonNeutralScores=Object.entries(fusedScores).length
+      ? Object.entries(fusedScores).filter(([key,value])=>key!=="neutral"&&Number.isFinite(+value)).sort((a,b)=>+b[1]-+a[1])
+      : Object.entries(f.scores||{}).filter(([key,value])=>key!=="neutral"&&Number.isFinite(+value)).sort((a,b)=>+b[1]-+a[1]);
+    const bestSubtle=nonNeutralScores[0]?.[0]||null;
+    let feedbackStrength=f.feedback_strength||"subtle";
+    if(rawEmotionLabel&&!noEmotion.has(rawEmotionLabel))lastClearEmotion={label:rawEmotionLabel,raw_label:rawEmotionLabel,strategy:S.strategy,at:performance.now()};
+    // Some Light-MER service builds return emotion_terms with a status other
+    // than the literal "estimate". Trust a non-empty model term for feedback.
+    if(fromAnswerWindow){
+      if(!feedbackEligible){
+        S.feedbackEmotionLabel="neutral";
+      }else if(mainEmotion&&!noEmotion.has(mainEmotion)){
+        S.feedbackEmotionLabel=mainEmotion.toLowerCase();
+        const cueWindows=answerEmotionWindows.filter((row)=>canonical(row.label)===mainEmotion).length;
+        const independentChannels=new Set(answerEmotionWindows.flatMap((row)=>Object.entries(row.channel_scores||{}).filter(([,scores])=>canonical(Object.entries(scores||{}).sort((a,b)=>+b[1]-+a[1])[0]?.[0])===mainEmotion).map(([name])=>name)));
+        feedbackStrength=independentChannels.size>=2||cueWindows>=2?"supported":"subtle";
+        log("main_emotion_selected",{emotion:S.feedbackEmotionLabel,raw_feedback_label:rawEmotionLabel,raw_fused_winner:f.label||null,strategy_target:strategyTarget,condition_target:strategyTarget,strategy_stimulus_delivered:S.strategyStimulusDelivered,target_prior_eligible:targetPriorEligible,target_prior_applied:targetPriorApplied,source:appliedTextCue?"explicit_transcript_emotion_cue":targetPriorApplied?"strategy_prior_adjusted_feedback":pooledScores[mainEmotion]!==undefined?"multimodal_answer_fusion":f.feedback_label?"multimodal_sensitive_candidate":bestSubtle?"lightmer_stage2_best_non_neutral":"lightmer_stage2",feedback_strength:feedbackStrength,model_status:f.status,sources:[...(f.sources||[]),...(recentFaceCue?["face_api"]:[]),...(appliedTextCue?["explicit_text"]:[])],scores:f.scores||{},pooled_scores:pooledScores,raw_fused_scores:fusedScores,feedback_scores:feedbackScores,channel_scores:mergedChannelScores,face_cue:recentFaceCue||null,text_cue:appliedTextCue||null,windows_in_answer:answerEmotionWindows.length,independent_channels:[...independentChannels]});
+      }else if(lastClearEmotion&&performance.now()-lastClearEmotion.at<=120000){
+        // Keep the most recent clear estimate through uncertain windows, up to
+        // the same two-minute context used by the emotion summary.
+        const retained=lastClearEmotion.raw_label;
+        S.feedbackEmotionLabel=String(retained).split(/[, +]/)[0].toLowerCase();
+        mainEmotion=canonical(S.feedbackEmotionLabel);
+        log("main_emotion_retained",{emotion:S.feedbackEmotionLabel,reason:"uncertain_window_under_2min"});
+      }
+    }
+    if (mainEmotion && !noEmotion.has(mainEmotion)) terms=[mainEmotion];
+    const label=mainEmotion&&!noEmotion.has(mainEmotion)?mainEmotion:(terms.length?terms.join(", "):(f.status==="estimate"&&f.label?f.label:"uncertain"));
+    if(f.transcript){$("liveTranscript").textContent=f.transcript;log("local_asr_result",{text:f.transcript,window_start_ms:f.client_start_ms,window_end_ms:f.client_end_ms,asr_ms:f.asr_ms});acceptLocalTranscript(f.transcript,fromAnswerWindow);}
+    const snapshot=getAffectSnapshot();log("affect_sample",{...snapshot,source:"lightmer_local_face_text_fusion",raw_feedback_label:rawEmotionLabel,displayed_feedback_label:mainEmotion||"uncertain",feedback_label:mainEmotion||"uncertain",strategy_target:strategyTarget,condition_target:strategyTarget,strategy_stimulus_delivered:S.strategyStimulusDelivered,target_prior_eligible:targetPriorEligible,target_prior_applied:targetPriorApplied,feedback_strength:feedbackStrength,sources:[...(f.sources||[]),...(faceWindow.cue?["face_api"]:[]),...(appliedTextCue?["explicit_text"]:[])],channel_scores:mergedChannelScores,face_cue:faceWindow.cue,face_samples:faceWindow.count,text_cue:appliedTextCue,raw_fused_scores:fusedScores,feedback_scores:feedbackScores,pooled_scores:pooledScores});$("xAffect").textContent=label;$("xSource").textContent=(f.status||"waiting")+" · multimodal ensemble";
+    $("dpLabel").textContent=label==="uncertain"?"Still uncertain":label;const st=$("dpStatus");if(st){const hints={"未检测到单个人脸":"No face signal · using available audio/text models","未检测到语音":"No speech signal · using available face/text models","未转写出文字":"No transcript · using available face/voice models","模型没有输出可用标签":"No emotion candidate available"};st.textContent=mainEmotion&&!noEmotion.has(mainEmotion)?`${feedbackStrength} affect cue · exploratory estimate`:(hints[f.demo_status]||"No clear estimate in this window");}
+    const p=curPhase();if(p&&p.kind==="chat"){if(S.condition==="direct")$("directPanel").classList.remove("hidden");if(fromAnswerWindow&&S.condition!=="none"&&label!==S.lastFeedbackLabel){log("feedback_render",{raw_feedback_label:rawEmotionLabel,displayed_feedback_label:label,feedback_label:label,feedback_condition:S.condition,strategy_target:strategyTarget,condition_target:strategyTarget,strategy_stimulus_delivered:S.strategyStimulusDelivered,target_prior_eligible:targetPriorEligible,target_prior_applied:targetPriorApplied,model_status:f.status});S.lastFeedbackLabel=label;}}
+  }
+  function setAiEmotion(label, animated = true) {
+    const term=String(label||"").toLowerCase().split(/[, +]/)[0].trim();
+    const aliases={frustration:"anger",angry:"anger",irritated:"anger",annoyed:"anger",annoyance:"anger",disapproval:"anger",embarrassment:"shame",happy:"happiness",joy:"happiness",amused:"happiness",amusement:"happiness",interested:"interest",curious:"interest",curiosity:"interest",sad:"sadness",disappointment:"sadness",anxiety:"fear",anxious:"fear",nervousness:"fear",disgusted:"disgust",surprised:"surprise",admiration:"pride"};
+    const allowed=new Set(["anger","shame","pride","happiness","interest","sadness","fear","disgust","surprise"]);
+    const emotion=allowed.has(aliases[term]||term)?(aliases[term]||term):"neutral";
+    const assets={neutral:"neutral",anger:"angry",shame:"embarrassed",pride:"proud",happiness:"joyful",interest:"curious",sadness:"sad",fear:"anxious",disgust:"unimpressed",surprise:"surprised"};
+    $("botTile").dataset.emotion=emotion;
+    const image=$("avatarFace");
+    if(image){image.src=`vendor/minicons-animated/${animated?assets[emotion]:"neutral-static"}.svg`;image.alt=`Alex's ${emotion} expression${animated?"":" (still while you speak)"}`;}
+  }
+  function renderSubtitleTint(label){const neg=/anger|frustrat|shame|sad|fear|anx|disgust|irritat/i.test(label),pos=/pride|happ|joy|interest|curios/i.test(label),root=document.documentElement.style;root.setProperty("--sub-hue",neg?8:pos?38:230);root.setProperty("--sub-sat",neg||pos?"38%":"12%");root.setProperty("--sub-light","95%");root.setProperty("--sub-border",".38");$("subtitle").classList.remove("pulse");}
+  function clearSubtitleTint(){const root=document.documentElement.style;for(const key of ["--sub-hue","--sub-sat","--sub-light","--sub-border"])root.removeProperty(key);$("subtitle").classList.remove("pulse");}
+  function renderDirect() { /* Stage 2 produces labels, not calibrated probabilities. */ }
 
   const frameCanvas = document.createElement("canvas");
   frameCanvas.width = 224; frameCanvas.height = 168;
-  function grabFrame() {
-    try {
-      frameCanvas.getContext("2d").drawImage($("selfVideo"), 0, 0, 224, 168);
-      return frameCanvas.toDataURL("image/jpeg", 0.7).split(",")[1];
-    } catch (e) { return null; }
-  }
-
-  // Other-mediated: valence shifts the subtitle window's hue/saturation,
-  // arousal raises border strength and adds a slow pulse. No labels, no numbers.
-  function renderSubtitleTint(f) {
-    const root = document.documentElement.style;
-    const v = f.valence, a = f.arousal;
-    const hue = v < 0 ? 8 : v > 0 ? 38 : 230;          // negative → rose, positive → warm amber
-    const sat = 12 + Math.min(1, Math.abs(v)) * 60;
-    root.setProperty("--sub-hue", hue);
-    root.setProperty("--sub-sat", sat.toFixed(0) + "%");
-    root.setProperty("--sub-light", (97 - Math.abs(v) * 6).toFixed(1) + "%");
-    root.setProperty("--sub-border", (0.12 + Math.max(0, a) * 0.7).toFixed(2));
-    const sub = $("subtitle");
-    if (a > 0.25) { sub.classList.add("pulse"); root.setProperty("--sub-pulse", (3.2 - a * 1.8).toFixed(2) + "s"); }
-    else sub.classList.remove("pulse");
-  }
-
-  function renderDirect(f) {
-    $("dpLabel").textContent = f.label;
-    $("dpDot").setAttribute("cx", (50 + f.valence * 44).toFixed(1));
-    $("dpDot").setAttribute("cy", (50 - f.arousal * 44).toFixed(1));
-    const bar = (el, x) => {
-      const w = Math.abs(x) * 50;
-      el.style.left = x >= 0 ? "50%" : (50 - w) + "%";
-      el.style.width = w + "%";
-    };
-    bar($("dpVal"), f.valence); bar($("dpAro"), f.arousal);
-    $("dpValNum").textContent = f.valence.toFixed(2);
-    $("dpAroNum").textContent = f.arousal.toFixed(2);
-  }
-
   // ------------------------------------------------------------------
   // Stop / end / export
   // ------------------------------------------------------------------
@@ -1316,6 +1643,12 @@
     hideNotice();
     log("session_end", { reason, n_probes_answered: S.probes.filter((x) => x.status === "answered").length });
     S.ended = true;
+    stopClientFaceCueDetector();
+    if (frameTimer) clearInterval(frameTimer); frameTimer = null;
+    if (emotionProcessor) { emotionProcessor.disconnect(); emotionProcessor.onaudioprocess = null; emotionProcessor = null; }
+    if (audioSource) { audioSource.disconnect(); audioSource = null; }
+    if (emotionCtx) { emotionCtx.close().catch(() => {}); emotionCtx = null; }
+    if (emotionToken) { fetch("/api/emotion/stop", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ session_token: emotionToken }) }).catch(() => {}); emotionToken = null; }
     setListening(false);
     stopSpeaking("session_end");
     window.speechSynthesis && speechSynthesis.cancel();

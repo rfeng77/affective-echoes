@@ -122,11 +122,10 @@
   // ---------------- Strategies ----------------
   const RULES = {
     neutral: "Restates the opinion and asks a factual follow-up. No praise, no criticism, no comfort.",
-    anger: "A mildly unfair rejection of the argument. Never the person, their intelligence or their character.",
-    shame: "Points to a gap between the standard the participant described and how they're doing right now. Never their worth.",
+    anger: "A direct challenge to the participant's argument and its evidence. Never the person, their intelligence or their character.",
     pride: "Specific praise for a reason or a contribution. Never a comparison with other people.",
   };
-  const EXAMPLE = { neutral: 1, anger: 1, shame: 1, pride: 1 };
+  const EXAMPLE = { neutral: 1, anger: 1, pride: 1 };
   wireTabs("stratTabs", (b) => {
     const s = b.dataset.s;
     $("stratLine").textContent = clean(C.strategies[s].fallback[EXAMPLE[s]]);

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Alex animated expression preview</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #202b34; background: #edf1f3; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; padding: 38px; }
+    main { max-width: 1280px; margin: auto; }
+    header { margin: 0 auto 26px; max-width: 760px; text-align: center; }
+    h1 { margin: 0 0 8px; font-size: clamp(28px, 4vw, 42px); letter-spacing: -.04em; }
+    header p { margin: 0; color: #5f6c75; line-height: 1.5; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 18px; }
+    .card { overflow: hidden; border: 1px solid #d8dfe3; border-radius: 24px; background: white; box-shadow: 0 12px 34px #1f2d3810; }
+    .stage { min-height: 220px; display: grid; place-items: center; padding: 18px; background: radial-gradient(ellipse at 50% 38%, #34424c, #202b34 72%); }
+    .stage img { display: block; width: 168px; height: 168px; object-fit: contain; filter: drop-shadow(0 12px 14px #0005); }
+    .name { padding: 13px 16px 4px; font-size: 15px; font-weight: 680; text-align: center; }
+    .detail { padding: 0 16px 16px; color: #64717a; font-size: 12px; text-align: center; }
+    .foot { margin: 22px auto 0; color: #5e6b74; font-size: 13px; line-height: 1.5; text-align: center; }
+    @media (max-width: 600px) { body { padding: 18px; } .stage { min-height: 190px; } .stage img { width: 145px; height: 145px; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>Alex · animated expressions</h1>
+      <p>Each face is one self-contained animated illustration, including its own mouth and expression. In Other-mediated projection, Alex's face follows the participant's selected affect cue; the other conditions keep a neutral face. Alex stays still while the participant speaks.</p>
+    </header>
+    <section class="grid" aria-label="Alex's animated expressions">
+      <article class="card"><div class="stage"><img src="vendor/minicons-animated/neutral.svg" alt="Neutral face" /></div><div class="name">Neutral</div><div class="detail">Neutral / no clear cue</div></article>
+      <article class="card"><div class="stage"><img src="vendor/minicons-animated/joyful.svg" alt="Joyful face" /></div><div class="name">Happiness</div><div class="detail">Joyful illustration</div></article>
+      <article class="card"><div class="stage"><img src="vendor/minicons-animated/angry.svg" alt="Angry face" /></div><div class="name">Anger</div><div class="detail">Angry illustration</div></article>
+      <article class="card"><div class="stage"><img src="vendor/minicons-animated/embarrassed.svg" alt="Embarrassed face" /></div><div class="name">Shame cue</div><div class="detail">Embarrassed illustration</div></article>
+      <article class="card"><div class="stage"><img src="vendor/minicons-animated/proud.svg" alt="Proud face" /></div><div class="name">Pride</div><div class="detail">Proud illustration</div></article>
+      <article class="card"><div class="stage"><img src="vendor/minicons-animated/curious.svg" alt="Curious face" /></div><div class="name">Interest</div><div class="detail">Curious illustration</div></article>
+      <article class="card"><div class="stage"><img src="vendor/minicons-animated/sad.svg" alt="Sad face" /></div><div class="name">Sadness</div><div class="detail">Sad illustration</div></article>
+      <article class="card"><div class="stage"><img src="vendor/minicons-animated/anxious.svg" alt="Anxious face" /></div><div class="name">Fear</div><div class="detail">Anxious illustration</div></article>
+      <article class="card"><div class="stage"><img src="vendor/minicons-animated/unimpressed.svg" alt="Unimpressed face" /></div><div class="name">Disgust cue</div><div class="detail">Closest available illustration</div></article>
+      <article class="card"><div class="stage"><img src="vendor/minicons-animated/surprised.svg" alt="Surprised face" /></div><div class="name">Surprise</div><div class="detail">Surprised illustration</div></article>
+    </section>
+    <p class="foot">Minicons Animated SVG faces are bundled locally under MIT License. The source set has a close match for each cue; shame and disgust use the nearest available artwork.</p>
+  </main>
+</body>
+</html>

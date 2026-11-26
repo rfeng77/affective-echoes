@@ -1,0 +1,9 @@
+Animated face artwork: Minicons Animated by Tanzim Siam.
+Source: https://github.com/tanximsiam/minicons-animated
+License: MIT. See LICENSE in this directory.
+
+Files included: angry.svg, anxious.svg, curious.svg, embarrassed.svg,
+joyful.svg, neutral.svg, proud.svg, sad.svg, surprised.svg, unimpressed.svg.
+neutral-static.svg is a local static copy derived from neutral.svg for the
+participant speaking turn; the experiment does not draw a separate mouth over
+the face artwork.
